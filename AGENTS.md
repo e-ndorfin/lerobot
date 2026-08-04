@@ -2,27 +2,32 @@ This file provides guidance to AI agents when working with code in this reposito
 
 > **User-facing help → [`AGENT_GUIDE.md`](./AGENT_GUIDE.md)** (SO-101 setup, recording, picking a policy, training duration, eval — with copy-pasteable commands).
 
+## Cluster Information
+See @CLUSTER.md for more information on the compute cluster this code is running on.
+
 ## Project Overview
 
 LeRobot is a PyTorch-based library for real-world robotics, providing datasets, pretrained policies, and tools for training, evaluation, data collection, and robot control. It integrates with Hugging Face Hub for model/dataset sharing.
 
 ## Tech Stack
 
-Python 3.12+ · PyTorch · Hugging Face (datasets, Hub, accelerate) · draccus (config/CLI) · Gymnasium (envs) · uv (package management)
+Python 3.12+ · PyTorch · Hugging Face (datasets, Hub, accelerate) · draccus (config/CLI) · Gymnasium (envs)
 
 ## Development Setup
 
 ```bash
-uv sync --locked                            # Base dependencies
-uv sync --locked --extra test --extra dev   # Test + dev tools
-uv sync --locked --extra all                # Everything
+source .venv/bin/activate                   # Activate the project environment
+python3 -m pip install -e .                 # Base dependencies
+python3 -m pip install -e ".[test,dev]"     # Test + dev tools
+python3 -m pip install -e ".[all]"          # Everything
 git lfs install && git lfs pull             # Test artifacts
 ```
 
 ## Key Commands
 
 ```bash
-uv run pytest tests -svv --maxfail=10                 # All tests
+source .venv/bin/activate                             # Activate the project environment
+python3 -m pytest tests -svv --maxfail=10             # All tests
 DEVICE=cuda make test-end-to-end                      # All E2E tests
 pre-commit run --all-files                           # Lint + format (ruff, typos, bandit, etc.)
 ```
@@ -46,11 +51,11 @@ pre-commit run --all-files                           # Lint + format (ruff, typo
 - **`examples/`** — End-user tutorials and scripts organized by use case (dataset creation, training, hardware setup).
 - **`docker/`** — Dockerfiles for user (`Dockerfile.user`) and CI (`Dockerfile.internal`).
 - **`benchmarks/`** — Performance benchmarking scripts.
-- **Root files**: `pyproject.toml` (single source of truth for deps, build, tool config), `Makefile` (E2E test targets), `uv.lock`, `CONTRIBUTING.md` & `README.md` (general information).
+- **Root files**: `pyproject.toml` (single source of truth for deps, build, tool config), `Makefile` (E2E test targets), `CONTRIBUTING.md` & `README.md` (general information).
 
 ## Notes
 
 - **Mypy is gradual**: strict only for `lerobot.envs`, `lerobot.configs`, `lerobot.optim`, `lerobot.model`, `lerobot.cameras`, `lerobot.motors`, `lerobot.transport`. Add type annotations when modifying these modules.
 - **Optional dependencies**: many policies, envs, and robots are behind extras (e.g., `lerobot[aloha]`). New imports for optional packages must be guarded or lazy. See `pyproject.toml [project.optional-dependencies]`.
 - **Video decoding**: datasets can store observations as video files. `LeRobotDataset` handles frame extraction, but tests need ffmpeg installed.
-- **Prioritize use of `uv run`** to execute Python commands (not raw `python` or `pip`).
+- **Activate `.venv` before Python commands**: run `source .venv/bin/activate`, then use `python3`.
