@@ -66,9 +66,12 @@ pre-commit run --all-files                           # Lint + format (ruff, typo
   dataclass fields live in `src/lerobot/utils/sample_weighting.py`.
 - `type=control_mode` reads the anchor frame's raw `observation.control_mode` before preprocessing and maps
   integer labels through `mode_weights`. It weights the whole BC loss for that sample/action chunk; it does
-  not assign separate weights to future actions inside the chunk. In the current Tangzach datasets, the
-  observed convention is 0=teleoperation/demo, 1=autonomous rollout, 2=human correction, and 4=rewind;
-  these are dataset conventions rather than a LeRobot enum, so verify a new dataset before relying on them.
+  not assign separate weights to future actions inside the chunk. The control-mode convention is
+  0=Teleoperation (normal human-controlled motion), 1=Policy (robot action produced by the policy),
+  2=Intervention (human takes control during a policy rollout), 3=Return (automated rewind/return trajectory
+  before intervention; historically called replay internally), 4=Homing (robot automatically moves to its
+  home pose), and 5=Pre-rewind (configured interval immediately before Return begins). These are dataset
+  conventions rather than a LeRobot enum, so verify a new dataset before relying on them.
 - Example CLI flags: `--sample_weighting.type=control_mode`
   `--sample_weighting.mode_weights='{"0":1.0,"1":0.5,"2":2.0,"4":0.0}'`. Omitted modes are errors unless
   `--sample_weighting.default_weight` is set.
