@@ -28,19 +28,29 @@ Example usage:
         kappa: 0.01
 
     # In training script
-    sample_weighter = make_sample_weighter(cfg.sample_weighting, policy, device, dataset_root=cfg.dataset.root, dataset_repo_id=cfg.dataset.repo_id)
+    sample_weighter = make_sample_weighter(
+        cfg.sample_weighting,
+        policy,
+        device,
+        dataset_root=cfg.dataset.root,
+        dataset_repo_id=cfg.dataset.repo_id,
+    )
     ...
     weights, stats = sample_weighter.compute_batch_weights(batch)
 """
 
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
+
+CONTROL_MODE_KEY = "observation.control_mode"
 
 if TYPE_CHECKING:
     from lerobot.policies.pretrained import PreTrainedPolicy
@@ -83,11 +93,14 @@ class SampleWeightingConfig:
     contains additional type-specific parameters.
 
     Attributes:
-        type: Weighting strategy type ("rabc", "uniform", etc.)
+        type: Weighting strategy type ("rabc", "control_mode", "uniform", etc.)
         progress_path: Path to precomputed progress values (for RABC)
         head_mode: Which model head to use for progress ("sparse" or "dense")
         kappa: Hard threshold for high-quality samples (RABC-specific)
         epsilon: Small constant for numerical stability
+        mode_weights: Mapping from integer control-mode labels to BC loss weights.
+        control_mode_key: Raw dataset feature containing the control-mode label.
+        default_weight: Weight for labels omitted from ``mode_weights``. ``None`` rejects unknown labels.
         extra_params: Additional type-specific parameters passed to the weighter
     """
 
@@ -96,6 +109,9 @@ class SampleWeightingConfig:
     head_mode: str = "sparse"
     kappa: float = 0.01
     epsilon: float = 1e-6
+    mode_weights: dict[int, float] = field(default_factory=dict)
+    control_mode_key: str = CONTROL_MODE_KEY
+    default_weight: float | None = None
     # Additional type-specific params can be added here or passed via extra_params
     extra_params: dict = field(default_factory=dict)
 
@@ -129,7 +145,17 @@ def make_sample_weighter(
         # No-op weighter that returns uniform weights
         return UniformWeighter(device=device)
 
-    raise ValueError(f"Unknown sample weighting type: '{config.type}'. Supported types: 'rabc', 'uniform'")
+    if config.type == "control_mode":
+        return ControlModeWeighter(
+            mode_weights=config.mode_weights,
+            device=device,
+            control_mode_key=config.control_mode_key,
+            default_weight=config.default_weight,
+        )
+
+    raise ValueError(
+        f"Unknown sample weighting type: '{config.type}'. Supported types: 'rabc', 'control_mode', 'uniform'"
+    )
 
 
 def _make_rabc_weighter(
@@ -237,3 +263,129 @@ class UniformWeighter(SampleWeighter):
     def get_stats(self) -> dict:
         """Return empty stats for uniform weighting."""
         return {"type": "uniform"}
+
+
+class ControlModeWeighter(SampleWeighter):
+    """Assign a BC loss weight from a raw per-frame control-mode label.
+
+    The returned weights are normalized to sum to the batch size when at least one
+    sample has non-zero weight. This keeps gradient scale stable while preserving
+    the configured weight ratios. A batch containing only zero-weight modes remains
+    all-zero and causes the training loop to skip its optimizer update.
+    """
+
+    def __init__(
+        self,
+        mode_weights: dict[int, float],
+        device: torch.device,
+        control_mode_key: str = CONTROL_MODE_KEY,
+        default_weight: float | None = None,
+    ) -> None:
+        if not mode_weights:
+            raise ValueError("control_mode sample weighting requires a non-empty mode_weights mapping")
+        if not control_mode_key:
+            raise ValueError("control_mode_key must not be empty")
+
+        self.mode_weights = {
+            self._validate_mode(mode): self._validate_weight(weight, f"mode {mode}")
+            for mode, weight in mode_weights.items()
+        }
+        if len(self.mode_weights) != len(mode_weights):
+            raise ValueError(f"mode_weights contains duplicate integer labels: {mode_weights}")
+        self.default_weight = (
+            None if default_weight is None else self._validate_weight(default_weight, "default_weight")
+        )
+        self.device = device
+        self.control_mode_key = control_mode_key
+        self._mode_counts: Counter[int] = Counter()
+        self._num_batches = 0
+        self._num_zero_weight_batches = 0
+
+    @staticmethod
+    def _validate_mode(mode: int) -> int:
+        if not isinstance(mode, int) or isinstance(mode, bool):
+            raise ValueError(f"control-mode labels must be integers, got {mode!r}")
+        return mode
+
+    @staticmethod
+    def _validate_weight(weight: float, name: str) -> float:
+        if not isinstance(weight, (int, float)) or isinstance(weight, bool):
+            raise ValueError(f"Weight for {name} must be numeric, got {weight!r}")
+        value = float(weight)
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"Weight for {name} must be finite and non-negative, got {weight!r}")
+        return value
+
+    def compute_batch_weights(self, batch: dict) -> tuple[torch.Tensor, dict]:
+        if self.control_mode_key not in batch:
+            raise ValueError(
+                f"control_mode sample weighting requires raw batch feature {self.control_mode_key!r}"
+            )
+
+        modes = torch.as_tensor(batch[self.control_mode_key]).detach()
+        if modes.ndim == 0:
+            modes = modes.unsqueeze(0)
+        if modes.ndim == 2 and modes.shape[1] == 1:
+            modes = modes[:, 0]
+        if modes.ndim != 1:
+            raise ValueError(
+                f"{self.control_mode_key} must contain one scalar label per sample, "
+                f"got shape {tuple(modes.shape)}"
+            )
+        if not torch.isfinite(modes).all():
+            raise ValueError(f"{self.control_mode_key} contains non-finite labels")
+
+        rounded_modes = modes.round()
+        if not torch.allclose(modes.to(torch.float64), rounded_modes.to(torch.float64)):
+            invalid = modes[modes != rounded_modes].tolist()
+            raise ValueError(f"{self.control_mode_key} contains non-integer labels: {invalid}")
+        mode_ids = rounded_modes.to(dtype=torch.int64, device="cpu")
+
+        observed_modes = sorted(set(mode_ids.tolist()))
+        unknown_modes = [mode for mode in observed_modes if mode not in self.mode_weights]
+        if unknown_modes and self.default_weight is None:
+            raise ValueError(
+                f"No BC weight configured for control modes {unknown_modes}; configured modes are "
+                f"{sorted(self.mode_weights)}. Set sample_weighting.default_weight to allow unknown modes."
+            )
+
+        fallback = 0.0 if self.default_weight is None else self.default_weight
+        device_mode_ids = mode_ids.to(self.device)
+        weights = torch.full((len(mode_ids),), fallback, dtype=torch.float32, device=self.device)
+        for mode, weight in self.mode_weights.items():
+            weights[device_mode_ids == mode] = weight
+
+        raw_weight_sum = weights.sum()
+        zero_weight_batch = bool(raw_weight_sum.item() == 0)
+        if not zero_weight_batch:
+            weights = weights * (len(weights) / raw_weight_sum)
+
+        counts = Counter(mode_ids.tolist())
+        self._mode_counts.update(counts)
+        self._num_batches += 1
+        self._num_zero_weight_batches += int(zero_weight_batch)
+
+        stats = {
+            "type": "control_mode",
+            "mean_weight": weights.mean().item() if len(weights) else 0.0,
+            "min_weight": weights.min().item() if len(weights) else 0.0,
+            "max_weight": weights.max().item() if len(weights) else 0.0,
+            "zero_weight_batch": int(zero_weight_batch),
+        }
+        for mode, count in sorted(counts.items()):
+            stats[f"mode_{mode}_count"] = count
+        return weights, stats
+
+    def get_stats(self) -> dict:
+        stats = {
+            "type": "control_mode",
+            "control_mode_key": self.control_mode_key,
+            "num_batches": self._num_batches,
+            "zero_weight_batches": self._num_zero_weight_batches,
+        }
+        for mode, weight in sorted(self.mode_weights.items()):
+            stats[f"mode_{mode}_weight"] = weight
+            stats[f"mode_{mode}_samples"] = self._mode_counts[mode]
+        if self.default_weight is not None:
+            stats["default_weight"] = self.default_weight
+        return stats

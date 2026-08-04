@@ -18,6 +18,7 @@
 
 from unittest.mock import Mock
 
+import draccus
 import pytest
 
 pytest.importorskip("pandas", reason="pandas is required (install lerobot[dataset])")
@@ -25,6 +26,8 @@ pytest.importorskip("pandas", reason="pandas is required (install lerobot[datase
 import torch
 
 from lerobot.utils.sample_weighting import (
+    CONTROL_MODE_KEY,
+    ControlModeWeighter,
     SampleWeighter,
     SampleWeightingConfig,
     UniformWeighter,
@@ -67,6 +70,9 @@ def test_config_default_values():
     assert config.head_mode == "sparse"
     assert config.kappa == 0.01
     assert config.epsilon == 1e-6
+    assert config.mode_weights == {}
+    assert config.control_mode_key == CONTROL_MODE_KEY
+    assert config.default_weight is None
     assert config.extra_params == {}
 
 
@@ -92,6 +98,22 @@ def test_config_uniform_type():
     """Test configuration for uniform weighting."""
     config = SampleWeightingConfig(type="uniform")
     assert config.type == "uniform"
+
+
+def test_config_control_mode_type():
+    config = SampleWeightingConfig(type="control_mode", mode_weights={0: 1.0, 2: 3.0, 4: 0.0})
+
+    assert config.type == "control_mode"
+    assert config.mode_weights == {0: 1.0, 2: 3.0, 4: 0.0}
+
+
+def test_config_control_mode_decodes_stringified_cli_mapping_keys():
+    config = draccus.decode(
+        SampleWeightingConfig,
+        {"type": "control_mode", "mode_weights": {"0": 1.0, "2": 3.0}},
+    )
+
+    assert config.mode_weights == {0: 1.0, 2: 3.0}
 
 
 # =============================================================================
@@ -183,6 +205,96 @@ def test_uniform_weighter_get_stats():
 
 
 # =============================================================================
+# ControlModeWeighter Tests
+# =============================================================================
+
+
+def test_control_mode_weighter_normalizes_configured_ratios():
+    weighter = ControlModeWeighter(
+        mode_weights={0: 1.0, 1: 0.5, 2: 2.0, 4: 0.0},
+        device=torch.device("cpu"),
+    )
+    batch = {CONTROL_MODE_KEY: torch.tensor([0.0, 1.0, 2.0, 4.0])}
+
+    weights, stats = weighter.compute_batch_weights(batch)
+
+    expected = torch.tensor([1.0, 0.5, 2.0, 0.0])
+    expected *= len(expected) / expected.sum()
+    assert torch.allclose(weights, expected)
+    assert weights.sum().item() == pytest.approx(4.0)
+    assert stats["mode_0_count"] == 1
+    assert stats["mode_4_count"] == 1
+    assert stats["zero_weight_batch"] == 0
+
+
+def test_control_mode_weighter_accepts_singleton_feature_dimension():
+    weighter = ControlModeWeighter(mode_weights={0: 1.0, 2: 2.0}, device=torch.device("cpu"))
+
+    weights, _ = weighter.compute_batch_weights({CONTROL_MODE_KEY: torch.tensor([[0.0], [2.0]])})
+
+    assert weights.shape == (2,)
+    assert weights.sum().item() == pytest.approx(2.0)
+
+
+def test_control_mode_weighter_uses_explicit_default_weight():
+    weighter = ControlModeWeighter(
+        mode_weights={0: 1.0},
+        default_weight=0.25,
+        device=torch.device("cpu"),
+    )
+
+    weights, _ = weighter.compute_batch_weights({CONTROL_MODE_KEY: torch.tensor([0.0, 9.0])})
+
+    assert torch.allclose(weights, torch.tensor([1.6, 0.4]))
+
+
+def test_control_mode_weighter_rejects_unknown_mode_without_default():
+    weighter = ControlModeWeighter(mode_weights={0: 1.0}, device=torch.device("cpu"))
+
+    with pytest.raises(ValueError, match="No BC weight configured"):
+        weighter.compute_batch_weights({CONTROL_MODE_KEY: torch.tensor([0.0, 2.0])})
+
+
+@pytest.mark.parametrize(
+    "batch,error",
+    [
+        ({}, "requires raw batch feature"),
+        ({CONTROL_MODE_KEY: torch.tensor([0.5])}, "non-integer labels"),
+        ({CONTROL_MODE_KEY: torch.tensor([[0.0, 1.0]])}, "one scalar label per sample"),
+    ],
+)
+def test_control_mode_weighter_rejects_invalid_batch(batch, error):
+    weighter = ControlModeWeighter(mode_weights={0: 1.0}, device=torch.device("cpu"))
+
+    with pytest.raises(ValueError, match=error):
+        weighter.compute_batch_weights(batch)
+
+
+@pytest.mark.parametrize(
+    "kwargs,error",
+    [
+        ({"mode_weights": {}}, "non-empty"),
+        ({"mode_weights": {0: -1.0}}, "non-negative"),
+        ({"mode_weights": {0: float("inf")}}, "finite"),
+        ({"mode_weights": {"0": 1.0}}, "labels must be integers"),
+    ],
+)
+def test_control_mode_weighter_rejects_invalid_config(kwargs, error):
+    with pytest.raises(ValueError, match=error):
+        ControlModeWeighter(device=torch.device("cpu"), **kwargs)
+
+
+def test_control_mode_weighter_preserves_all_zero_batch():
+    weighter = ControlModeWeighter(mode_weights={4: 0.0}, device=torch.device("cpu"))
+
+    weights, stats = weighter.compute_batch_weights({CONTROL_MODE_KEY: torch.tensor([4.0, 4.0])})
+
+    assert torch.equal(weights, torch.zeros(2))
+    assert stats["zero_weight_batch"] == 1
+    assert weighter.get_stats()["zero_weight_batches"] == 1
+
+
+# =============================================================================
 # make_sample_weighter Factory Tests
 # =============================================================================
 
@@ -206,6 +318,16 @@ def test_factory_creates_uniform_weighter():
     weighter = make_sample_weighter(config, policy, device)
 
     assert isinstance(weighter, UniformWeighter)
+    assert isinstance(weighter, SampleWeighter)
+
+
+def test_factory_creates_control_mode_weighter():
+    config = SampleWeightingConfig(type="control_mode", mode_weights={0: 1.0, 2: 2.0})
+    policy = Mock()
+
+    weighter = make_sample_weighter(config, policy, torch.device("cpu"))
+
+    assert isinstance(weighter, ControlModeWeighter)
     assert isinstance(weighter, SampleWeighter)
 
 
