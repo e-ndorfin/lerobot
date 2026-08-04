@@ -154,6 +154,7 @@ dmypy.json
 nautilus/*.yaml
 *.key
 sbatch*.sh
+/slurm_logs/
 
 ### Miscellaneous ###
 # W&B
