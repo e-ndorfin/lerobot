@@ -54,9 +54,11 @@ class ACTConfig(PreTrainedConfig):
             the output data name, and the value is PolicyFeature, which consists of FeatureType and shape attributes.
         normalization_mapping: A dictionary that maps from a str value of FeatureType (e.g., "STATE", "VISUAL") to
             a corresponding NormalizationMode (e.g., NormalizationMode.MIN_MAX)
-        vision_backbone: Name of the torchvision resnet backbone to use for encoding images.
-        pretrained_backbone_weights: Pretrained weights from torchvision to initialize the backbone.
-            `None` means no pretrained weights.
+        vision_backbone: Name of the torchvision ResNet backbone or Hugging Face CLIP vision model to use
+            for encoding images. CLIP models use their patch tokens as ACT's spatial feature map.
+        pretrained_backbone_weights: Pretrained weights from torchvision to initialize a ResNet backbone.
+            `None` means no pretrained weights. This setting is ignored for Hugging Face CLIP models, which
+            are initialized from `vision_backbone` with `from_pretrained`.
         replace_final_stride_with_dilation: Whether to replace the ResNet's final 2x2 stride with a dilated
             convolution.
         pre_norm: Whether to use "pre-norm" in the transformer blocks.
@@ -146,9 +148,10 @@ class ACTConfig(PreTrainedConfig):
                 raise ValueError(f"robot_state_indices must be non-negative: {self.robot_state_indices}")
             if len(self.robot_state_indices) != len(set(self.robot_state_indices)):
                 raise ValueError(f"robot_state_indices contains duplicates: {self.robot_state_indices}")
-        if not self.vision_backbone.startswith("resnet"):
+        if not (self.vision_backbone.startswith("resnet") or "clip" in self.vision_backbone.lower()):
             raise ValueError(
-                f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
+                "`vision_backbone` must be a torchvision ResNet variant or a Hugging Face CLIP model. "
+                f"Got {self.vision_backbone}."
             )
         if self.temporal_ensemble_coeff is not None and self.n_action_steps > 1:
             raise NotImplementedError(

@@ -23,6 +23,7 @@ import math
 from collections import deque
 from collections.abc import Callable
 from itertools import chain
+from typing import TYPE_CHECKING
 
 import einops
 import numpy as np
@@ -34,9 +35,57 @@ from torchvision.models._utils import IntermediateLayerGetter
 from torchvision.ops.misc import FrozenBatchNorm2d
 
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
+from lerobot.utils.import_utils import _transformers_available, require_package
 
 from ..pretrained import PreTrainedPolicy
 from .configuration_act import ACTConfig
+
+if TYPE_CHECKING or _transformers_available:
+    from transformers import CLIPVisionModel
+else:
+    CLIPVisionModel = None
+
+
+class ACTCLIPVisionBackbone(nn.Module):
+    """Adapt a Hugging Face CLIP ViT's spatial patch tokens to ACT's feature-map interface."""
+
+    def __init__(self, model_name: str):
+        super().__init__()
+        require_package("transformers", extra="transformers-dep")
+        self.model = CLIPVisionModel.from_pretrained(model_name)
+        self.image_size = self.model.config.image_size
+        self.patch_size = self.model.config.patch_size
+        self.out_channels = self.model.config.hidden_size
+
+        if not isinstance(self.image_size, int) or not isinstance(self.patch_size, int):
+            raise ValueError(
+                "ACT's CLIP adapter requires scalar image_size and patch_size values, got "
+                f"image_size={self.image_size} and patch_size={self.patch_size}."
+            )
+        if self.image_size % self.patch_size != 0:
+            raise ValueError(
+                f"CLIP image size {self.image_size} must be divisible by patch size {self.patch_size}."
+            )
+
+    def forward(self, x: Tensor) -> dict[str, Tensor]:
+        target_shape = (self.image_size, self.image_size)
+        if x.shape[-2:] != target_shape:
+            x = F.interpolate(x, size=target_shape, mode="bilinear", align_corners=False, antialias=True)
+
+        outputs = self.model(pixel_values=x, output_hidden_states=False)
+        patch_tokens = outputs.last_hidden_state[:, 1:]
+        grid_size = self.image_size // self.patch_size
+        expected_tokens = grid_size**2
+        if patch_tokens.shape[1] != expected_tokens:
+            raise ValueError(f"Expected {expected_tokens} CLIP patch tokens, got {patch_tokens.shape[1]}.")
+
+        feature_map = einops.rearrange(
+            patch_tokens,
+            "b (h w) c -> b c h w",
+            h=grid_size,
+            w=grid_size,
+        )
+        return {"feature_map": feature_map}
 
 
 class ACTPolicy(PreTrainedPolicy):
@@ -324,15 +373,20 @@ class ACT(nn.Module):
 
         # Backbone for image feature extraction.
         if self.config.image_features:
-            backbone_model = getattr(torchvision.models, config.vision_backbone)(
-                replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
-                weights=config.pretrained_backbone_weights,
-                norm_layer=FrozenBatchNorm2d,
-            )
-            # Note: The assumption here is that we are using a ResNet model (and hence layer4 is the final
-            # feature map).
-            # Note: The forward method of this returns a dict: {"feature_map": output}.
-            self.backbone = IntermediateLayerGetter(backbone_model, return_layers={"layer4": "feature_map"})
+            if config.vision_backbone.startswith("resnet"):
+                backbone_model = getattr(torchvision.models, config.vision_backbone)(
+                    replace_stride_with_dilation=[False, False, config.replace_final_stride_with_dilation],
+                    weights=config.pretrained_backbone_weights,
+                    norm_layer=FrozenBatchNorm2d,
+                )
+                # IntermediateLayerGetter returns a dict: {"feature_map": output}.
+                self.backbone = IntermediateLayerGetter(
+                    backbone_model, return_layers={"layer4": "feature_map"}
+                )
+                backbone_out_channels = backbone_model.fc.in_features
+            else:
+                self.backbone = ACTCLIPVisionBackbone(config.vision_backbone)
+                backbone_out_channels = self.backbone.out_channels
 
         # Transformer (acts as VAE decoder when training with the variational objective).
         self.encoder = ACTEncoder(config)
@@ -351,7 +405,7 @@ class ACT(nn.Module):
         self.encoder_latent_input_proj = nn.Linear(config.latent_dim, config.dim_model)
         if self.config.image_features:
             self.encoder_img_feat_input_proj = nn.Conv2d(
-                backbone_model.fc.in_features, config.dim_model, kernel_size=1
+                backbone_out_channels, config.dim_model, kernel_size=1
             )
         # Transformer encoder positional embeddings.
         n_1d_tokens = 1  # for the latent
