@@ -59,6 +59,7 @@ class ACTPolicy(PreTrainedPolicy):
                     the configuration class is used.
         """
         super().__init__(config)
+        config.apply_robot_state_selection()
         config.validate_features()
         self.config = config
 

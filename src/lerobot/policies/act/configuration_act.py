@@ -15,8 +15,9 @@
 # limitations under the License.
 from dataclasses import dataclass, field
 
-from lerobot.configs import NormalizationMode, PreTrainedConfig
+from lerobot.configs import NormalizationMode, PolicyFeature, PreTrainedConfig
 from lerobot.optim import AdamWConfig
+from lerobot.utils.constants import OBS_STATE
 
 
 @PreTrainedConfig.register_subclass("act")
@@ -84,6 +85,9 @@ class ACTConfig(PreTrainedConfig):
     n_obs_steps: int = 1
     chunk_size: int = 100
     n_action_steps: int = 100
+    # Optional indices selected from the raw observation.state vector before
+    # normalization and model input. Saved with the policy for inference parity.
+    robot_state_indices: list[int] | None = None
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
@@ -131,6 +135,17 @@ class ACTConfig(PreTrainedConfig):
         super().__post_init__()
 
         """Input validation (not exhaustive)."""
+        if self.robot_state_indices is not None:
+            if not self.robot_state_indices:
+                raise ValueError("robot_state_indices must not be empty")
+            if any(
+                not isinstance(index, int) or isinstance(index, bool) for index in self.robot_state_indices
+            ):
+                raise ValueError(f"robot_state_indices must contain only integers: {self.robot_state_indices}")
+            if any(index < 0 for index in self.robot_state_indices):
+                raise ValueError(f"robot_state_indices must be non-negative: {self.robot_state_indices}")
+            if len(self.robot_state_indices) != len(set(self.robot_state_indices)):
+                raise ValueError(f"robot_state_indices contains duplicates: {self.robot_state_indices}")
         if not self.vision_backbone.startswith("resnet"):
             raise ValueError(
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
@@ -149,6 +164,33 @@ class ACTConfig(PreTrainedConfig):
             raise ValueError(
                 f"Multiple observation steps not handled yet. Got `nobs_steps={self.n_obs_steps}`"
             )
+
+    def apply_robot_state_selection(self) -> None:
+        """Update the model-facing state feature to match ``robot_state_indices``."""
+        if self.robot_state_indices is None:
+            return
+        if not self.input_features or OBS_STATE not in self.input_features:
+            raise ValueError("robot_state_indices requires an observation.state input feature")
+
+        feature = self.input_features[OBS_STATE]
+        if len(feature.shape) != 1:
+            raise ValueError(f"observation.state must be one-dimensional, got shape {feature.shape}")
+
+        source_dim = feature.shape[0]
+        selected_dim = len(self.robot_state_indices)
+        # Loaded checkpoints already record the selected model-facing shape.
+        if source_dim == selected_dim:
+            return
+        if max(self.robot_state_indices) >= source_dim:
+            raise ValueError(
+                f"robot_state_indices {self.robot_state_indices} exceed observation.state dimension {source_dim}"
+            )
+
+        self.input_features = dict(self.input_features)
+        self.input_features[OBS_STATE] = PolicyFeature(
+            type=feature.type,
+            shape=(selected_dim,),
+        )
 
     def get_optimizer_preset(self) -> AdamWConfig:
         return AdamWConfig(

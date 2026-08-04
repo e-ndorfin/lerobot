@@ -22,7 +22,7 @@ import torch
 
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.policies.act.configuration_act import ACTConfig
-from lerobot.policies.act.processor_act import make_act_pre_post_processors
+from lerobot.policies.act.processor_act import SelectRobotStateProcessorStep, make_act_pre_post_processors
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DataProcessorPipeline,
@@ -113,6 +113,30 @@ def test_act_processor_normalization():
 
     # Check that action is unnormalized
     assert postprocessed.shape == (1, 4)
+
+
+def test_act_processor_selects_robot_state_before_normalization():
+    config = create_default_config()
+    config.input_features[OBS_STATE] = PolicyFeature(type=FeatureType.STATE, shape=(3,))
+    config.robot_state_indices = [0, 2, 4]
+    stats = create_default_stats()
+    stats[OBS_STATE] = {
+        "mean": torch.tensor([1.0, 20.0, 3.0, 40.0, 5.0]),
+        "std": torch.tensor([1.0, 2.0, 1.0, 4.0, 1.0]),
+    }
+
+    preprocessor, _ = make_act_pre_post_processors(config, stats)
+    processed = preprocessor(
+        {
+            OBS_STATE: torch.tensor([2.0, 200.0, 5.0, 400.0, 8.0]),
+            ACTION: torch.zeros(4),
+        }
+    )
+
+    assert len(preprocessor.steps) == 5
+    assert isinstance(preprocessor.steps[1], SelectRobotStateProcessorStep)
+    assert processed[OBS_STATE].shape == (1, 3)
+    assert torch.equal(processed[OBS_STATE], torch.tensor([[1.0, 2.0, 3.0]]))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
