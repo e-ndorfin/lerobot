@@ -19,6 +19,7 @@ Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wand
 """
 
 import dataclasses
+import inspect
 import logging
 import sys
 import time
@@ -71,6 +72,81 @@ from lerobot.utils.utils import (
 from .lerobot_eval import eval_policy_all
 
 
+def _supports_unreduced_loss(policy: PreTrainedPolicy) -> bool:
+    """Return whether a policy explicitly exposes ``forward(..., reduction=...)``."""
+    try:
+        parameters = inspect.signature(policy.forward).parameters
+    except (TypeError, ValueError):
+        return False
+    return "reduction" in parameters
+
+
+def _slice_batch(value: Any, indices: torch.Tensor, batch_size: int) -> Any:
+    """Select batch entries recursively while leaving non-batched metadata unchanged."""
+    if isinstance(value, torch.Tensor):
+        if value.ndim > 0 and value.shape[0] == batch_size:
+            return value.index_select(0, indices.to(value.device))
+        return value
+    if isinstance(value, dict):
+        return {key: _slice_batch(item, indices, batch_size) for key, item in value.items()}
+    if isinstance(value, list) and len(value) == batch_size:
+        selected = indices.detach().cpu().tolist()
+        return [value[index] for index in selected]
+    if isinstance(value, tuple) and len(value) == batch_size:
+        selected = indices.detach().cpu().tolist()
+        return tuple(value[index] for index in selected)
+    return value
+
+
+def _forward_grouped_by_weight(
+    policy: PreTrainedPolicy,
+    batch: dict[str, Any],
+    sample_weights: torch.Tensor,
+) -> tuple[torch.Tensor, dict | None]:
+    """Apply exact sample weighting to scalar-loss policies by grouping equal weights.
+
+    Control-mode weighting has only a small number of distinct weights, so this
+    fallback keeps the feature policy-agnostic without requiring one forward pass
+    per sample. Policies that expose ``reduction="none"`` use the faster path in
+    :func:`update_policy` instead. This assumes the policy's scalar loss is a mean
+    over samples, which is the training loss convention used by LeRobot policies.
+    """
+    batch_size = len(sample_weights)
+    positive_weights = torch.unique(sample_weights[sample_weights > 0], sorted=True)
+    if len(positive_weights) == 0:
+        loss, output_dict = policy.forward(batch)
+        zero_loss = loss * 0
+        if output_dict is None:
+            output_dict = {}
+        output_dict["sample_weight_grouped_forwards"] = 1
+        return zero_loss, output_dict
+
+    weighted_loss = None
+    total_weight = sample_weights.sum()
+    output_dict: dict[str, Any] = {}
+    grouped_forwards = 0
+    for weight in positive_weights:
+        indices = torch.nonzero(sample_weights == weight, as_tuple=False).flatten()
+        grouped_batch = _slice_batch(batch, indices, batch_size)
+        group_loss, group_output = policy.forward(grouped_batch)
+        contribution = group_loss * weight * len(indices)
+        weighted_loss = contribution if weighted_loss is None else weighted_loss + contribution
+        grouped_forwards += 1
+
+        if group_output:
+            for key, value in group_output.items():
+                if isinstance(value, (int, float)):
+                    output_dict[key] = output_dict.get(key, 0.0) + float(value) * weight.item() * len(indices)
+
+    if weighted_loss is None:
+        raise RuntimeError("Grouped sample weighting produced no loss")
+    loss = weighted_loss / total_weight.clamp_min(1e-6)
+    for key in list(output_dict):
+        output_dict[key] /= total_weight.item()
+    output_dict["sample_weight_grouped_forwards"] = grouped_forwards
+    return loss, output_dict
+
+
 def update_policy(
     train_metrics: MetricsTracker,
     policy: PreTrainedPolicy,
@@ -81,6 +157,9 @@ def update_policy(
     lr_scheduler=None,
     lock=None,
     sample_weighter=None,
+    sample_weights: torch.Tensor | None = None,
+    weight_stats: dict | None = None,
+    supports_unreduced_loss: bool | None = None,
 ) -> tuple[MetricsTracker, dict | None]:
     """
     Performs a single training step to update the policy's weights.
@@ -97,7 +176,10 @@ def update_policy(
         accelerator: The Accelerator instance for distributed training and mixed precision.
         lr_scheduler: An optional learning rate scheduler.
         lock: An optional lock for thread-safe optimizer updates.
-        sample_weighter: Optional SampleWeighter instance for per-sample loss weighting.
+        sample_weighter: Optional legacy path for computing weights from the provided batch.
+        sample_weights: Optional weights computed from the raw batch before preprocessing.
+        weight_stats: Statistics returned alongside ``sample_weights``.
+        supports_unreduced_loss: Whether the policy supports ``forward(reduction="none")``.
 
     Returns:
         A tuple containing:
@@ -110,31 +192,44 @@ def update_policy(
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
-    # Compute sample weights if a weighter is provided
-    sample_weights = None
-    weight_stats = None
-    if sample_weighter is not None:
+    # Backward-compatible path for callers outside the main training loop. The
+    # loop computes weights before preprocessing so categorical labels stay raw.
+    if sample_weights is None and sample_weighter is not None:
         sample_weights, weight_stats = sample_weighter.compute_batch_weights(batch)
+
+    skip_optimizer_step = False
+    if sample_weights is not None:
+        # All ranks must make the same step/skip decision. In particular, skipping
+        # a local zero-weight shard while another rank steps would desynchronize DDP.
+        global_weight_sum = sample_weights.detach().sum()
+        if hasattr(accelerator, "reduce"):
+            global_weight_sum = accelerator.reduce(global_weight_sum, reduction="sum")
+        skip_optimizer_step = global_weight_sum.item() == 0
 
     # Let accelerator handle mixed precision
     with accelerator.autocast():
         if sample_weights is not None:
-            # Use per-sample loss for weighted training
-            # Note: Policies supporting sample weighting must implement forward(batch, reduction="none")
-            per_sample_loss, output_dict = policy.forward(batch, reduction="none")
+            if supports_unreduced_loss is None:
+                supports_unreduced_loss = _supports_unreduced_loss(policy)
 
-            # Weighted loss: each sample's contribution is scaled by its weight.
-            # We divide by weight sum (not batch size) so that if some weights are zero,
-            # the remaining samples contribute proportionally more, preserving gradient scale.
-            # Weights are pre-normalized to sum to batch_size for stable training dynamics.
-            epsilon = 1e-6
-            loss = (per_sample_loss * sample_weights).sum() / (sample_weights.sum() + epsilon)
+            if supports_unreduced_loss:
+                per_sample_loss, output_dict = policy.forward(batch, reduction="none")
+                if per_sample_loss.ndim != 1 or per_sample_loss.shape != sample_weights.shape:
+                    raise ValueError(
+                        "Policies using sample weighting must return one loss per sample from "
+                        f"forward(reduction='none'); got {tuple(per_sample_loss.shape)} for weights "
+                        f"{tuple(sample_weights.shape)}"
+                    )
+                loss = (per_sample_loss * sample_weights).sum() / sample_weights.sum().clamp_min(1e-6)
+            else:
+                loss, output_dict = _forward_grouped_by_weight(policy, batch, sample_weights)
 
             # Log weighting statistics
             if output_dict is None:
                 output_dict = {}
-            for key, value in weight_stats.items():
-                output_dict[f"sample_weight_{key}"] = value
+            if weight_stats is not None:
+                for key, value in weight_stats.items():
+                    output_dict[f"sample_weight_{key}"] = value
         else:
             loss, output_dict = policy.forward(batch)
 
@@ -151,19 +246,28 @@ def update_policy(
             policy.parameters(), float("inf"), error_if_nonfinite=False
         )
 
-    # Optimizer step
-    with lock if lock is not None else nullcontext():
-        optimizer.step()
+    # A zero-weight batch must not invoke AdamW: even with zero gradients its
+    # decoupled weight decay would otherwise change the policy.
+    if not skip_optimizer_step:
+        with lock if lock is not None else nullcontext():
+            optimizer.step()
 
     optimizer.zero_grad()
 
     # Step through pytorch scheduler at every batch instead of epoch
-    if lr_scheduler is not None:
+    if lr_scheduler is not None and not skip_optimizer_step:
         lr_scheduler.step()
 
     # Update internal buffers if policy has update method
-    if has_method(accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"):
+    if not skip_optimizer_step and has_method(
+        accelerator.unwrap_model(policy, keep_fp32_wrapper=True), "update"
+    ):
         accelerator.unwrap_model(policy, keep_fp32_wrapper=True).update()
+
+    if skip_optimizer_step:
+        if output_dict is None:
+            output_dict = {}
+        output_dict["sample_weight_skipped_update"] = 1
 
     train_metrics.loss = loss.item()
     train_metrics.grad_norm = grad_norm.item()
@@ -375,6 +479,12 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             dataset_root=cfg.dataset.root,
             dataset_repo_id=cfg.dataset.repo_id,
         )
+    supports_unreduced_loss = _supports_unreduced_loss(policy)
+    if sample_weighter is not None and not supports_unreduced_loss and is_main_process:
+        logging.info(
+            "Policy does not expose forward(reduction='none'); sample weighting will group equal weights "
+            "and run one forward pass per distinct non-zero weight."
+        )
 
     step = 0  # number of policy updates (forward + backward + optim)
 
@@ -562,6 +672,12 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
+        sample_weights = None
+        weight_stats = None
+        if sample_weighter is not None:
+            # Categorical metadata such as observation.control_mode must be read
+            # before the policy preprocessor can normalize observation features.
+            sample_weights, weight_stats = sample_weighter.compute_batch_weights(batch)
         for cam_key in dataset.meta.camera_keys:
             if cam_key in batch and batch[cam_key].dtype == torch.uint8:
                 batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
@@ -576,7 +692,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             cfg.optimizer.grad_clip_norm,
             accelerator=accelerator,
             lr_scheduler=lr_scheduler,
-            sample_weighter=sample_weighter,
+            sample_weights=sample_weights,
+            weight_stats=weight_stats,
+            supports_unreduced_loss=supports_unreduced_loss,
         )
 
         # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
