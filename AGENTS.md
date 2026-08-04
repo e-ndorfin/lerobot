@@ -59,3 +59,19 @@ pre-commit run --all-files                           # Lint + format (ruff, typo
 - **Optional dependencies**: many policies, envs, and robots are behind extras (e.g., `lerobot[aloha]`). New imports for optional packages must be guarded or lazy. See `pyproject.toml [project.optional-dependencies]`.
 - **Video decoding**: datasets can store observations as video files. `LeRobotDataset` handles frame extraction, but tests need ffmpeg installed.
 - **Activate `.venv` before Python commands**: run `source .venv/bin/activate`, then use `python3`.
+
+## Training Sample Weighting
+
+- Policy-agnostic weighting is configured at `TrainPipelineConfig.sample_weighting`; strategies and their
+  dataclass fields live in `src/lerobot/utils/sample_weighting.py`.
+- `type=control_mode` reads the anchor frame's raw `observation.control_mode` before preprocessing and maps
+  integer labels through `mode_weights`. It weights the whole BC loss for that sample/action chunk; it does
+  not assign separate weights to future actions inside the chunk. In the current Tangzach datasets, the
+  observed convention is 0=teleoperation/demo, 1=autonomous rollout, 2=human correction, and 4=rewind;
+  these are dataset conventions rather than a LeRobot enum, so verify a new dataset before relying on them.
+- Example CLI flags: `--sample_weighting.type=control_mode`
+  `--sample_weighting.mode_weights='{"0":1.0,"1":0.5,"2":2.0,"4":0.0}'`. Omitted modes are errors unless
+  `--sample_weighting.default_weight` is set.
+- Policies can implement `forward(batch, reduction="none")` for an efficient per-sample loss path. Policies
+  exposing only a scalar mean loss remain supported through grouped forwards, one per distinct non-zero
+  weight in the batch. Keep this compatibility path when adding weighting strategies or policies.
