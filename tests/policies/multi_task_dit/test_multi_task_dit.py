@@ -175,6 +175,9 @@ def test_multi_task_dit_policy_forward(batch_size: int, state_dim: int, action_d
     assert loss.item() is not None
     assert loss.shape == ()
 
+    per_sample_loss, _ = policy.forward(processed_batch, reduction="none")
+    assert per_sample_loss.shape == (batch_size,)
+
     # Test backward pass
     loss.backward()
 

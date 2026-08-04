@@ -188,12 +188,14 @@ class MultiTaskDiTPolicy(PreTrainedPolicy):
         action = self._queues[ACTION].popleft()
         return action
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict | None]:
+    def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict | None]:
         """Run the batch through the model and compute the loss for training"""
+        if reduction not in {"mean", "none"}:
+            raise ValueError(f"Unsupported reduction={reduction!r}. Expected 'mean' or 'none'.")
         batch = self._prepare_batch(batch)
 
         conditioning_vec = self.observation_encoder.encode(batch)
-        loss = self.objective.compute_loss(self.noise_predictor, batch, conditioning_vec)
+        loss = self.objective.compute_loss(self.noise_predictor, batch, conditioning_vec, reduction=reduction)
 
         return loss, None
 
@@ -665,7 +667,13 @@ class DiffusionObjective(nn.Module):
             else self.noise_scheduler.config.num_train_timesteps
         )
 
-    def compute_loss(self, model: nn.Module, batch: dict[str, Tensor], conditioning_vec: Tensor) -> Tensor:
+    def compute_loss(
+        self,
+        model: nn.Module,
+        batch: dict[str, Tensor],
+        conditioning_vec: Tensor,
+        reduction: str = "mean",
+    ) -> Tensor:
         clean_actions = batch[ACTION]
         noise = torch.randn_like(clean_actions)
         timesteps = torch.randint(
@@ -689,9 +697,14 @@ class DiffusionObjective(nn.Module):
 
         if self.do_mask_loss_for_padding and "action_is_pad" in batch:
             mask = ~batch["action_is_pad"].unsqueeze(-1)
+            if reduction == "none":
+                num_valid = mask.sum(dim=(1, 2)) * loss.shape[-1]
+                return (loss * mask).sum(dim=(1, 2)) / num_valid.clamp_min(1)
             num_valid = mask.sum() * loss.shape[-1]
             return (loss * mask).sum() / num_valid.clamp_min(1)
 
+        if reduction == "none":
+            return loss.mean(dim=(1, 2))
         return loss.mean()
 
     def conditional_sample(self, model: nn.Module, batch_size: int, conditioning_vec: Tensor) -> Tensor:
@@ -738,7 +751,13 @@ class FlowMatchingObjective(nn.Module):
         else:
             raise ValueError(f"Unknown timestep strategy: {self.config.timestep_sampling_strategy}")
 
-    def compute_loss(self, model: nn.Module, batch: dict[str, Tensor], conditioning_vec: Tensor) -> Tensor:
+    def compute_loss(
+        self,
+        model: nn.Module,
+        batch: dict[str, Tensor],
+        conditioning_vec: Tensor,
+        reduction: str = "mean",
+    ) -> Tensor:
         data = batch[ACTION]
         batch_size = data.shape[0]
         device = data.device
@@ -754,9 +773,14 @@ class FlowMatchingObjective(nn.Module):
 
         if self.do_mask_loss_for_padding and "action_is_pad" in batch:
             mask = ~batch["action_is_pad"].unsqueeze(-1)
+            if reduction == "none":
+                num_valid = mask.sum(dim=(1, 2)) * loss.shape[-1]
+                return (loss * mask).sum(dim=(1, 2)) / num_valid.clamp_min(1)
             num_valid = mask.sum() * loss.shape[-1]
             return (loss * mask).sum() / num_valid.clamp_min(1)
 
+        if reduction == "none":
+            return loss.mean(dim=(1, 2))
         return loss.mean()
 
     def conditional_sample(self, model: nn.Module, batch_size: int, conditioning_vec: Tensor) -> Tensor:
