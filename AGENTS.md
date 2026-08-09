@@ -2,6 +2,10 @@ This file provides guidance to AI agents when working with code in this reposito
 
 > **User-facing help → [`AGENT_GUIDE.md`](./AGENT_GUIDE.md)** (SO-101 setup, recording, picking a policy, training duration, eval — with copy-pasteable commands).
 
+# Most IMPORTANT information
+NEVER, and I mean NEVER, save model artifacts to WandB. I prefer to keep WandB online, but you must ONLY upload normal things like logs, loss, config etc. I only have 5GB. You cannot save ANY model artifacts to WandB.
+
+
 ## Cluster Information
 See @CLUSTER.md for more information on the compute cluster this code is running on.
 
@@ -32,6 +36,13 @@ DEVICE=cuda make test-end-to-end                      # All E2E tests
 pre-commit run --all-files                           # Lint + format (ruff, typos, bandit, etc.)
 ```
 
+## Weights & Biases Storage
+
+- **Never upload models, checkpoints, training states, datasets, videos, or other agent-created artifacts to Weights & Biases.**
+- W&B may be used for scalar metrics and ordinary run metadata only. Do not enable artifact/model logging, call artifact upload APIs, or configure checkpoint synchronization.
+- Every agent-created LeRobot training command with W&B enabled must explicitly pass `--wandb.disable_artifact=true`; do not rely on its default value.
+- Do not push a model or any other artifact to W&B unless the user explicitly requests that specific upload, even when W&B is already enabled for metrics.
+
 ## Architecture (`src/lerobot/`)
 
 - **`scripts/`** — CLI entry points (`lerobot-train`, `lerobot-eval`, `lerobot-record`, etc.), mapped in `pyproject.toml [project.scripts]`.
@@ -53,15 +64,19 @@ pre-commit run --all-files                           # Lint + format (ruff, typo
 - **`benchmarks/`** — Performance benchmarking scripts.
 - **Root files**: `pyproject.toml` (single source of truth for deps, build, tool config), `Makefile` (E2E test targets), `CONTRIBUTING.md` & `README.md` (general information).
 
+## Slurm Training DataLoader Defaults
+
+- Always reserve 20 CPUs for training jobs with `#SBATCH --cpus-per-task=20`.
+- Always configure training DataLoaders with `--num_workers=14`, `--prefetch_factor=4`, and
+  `--persistent_workers=true`.
+
 ## Notes
 
 - **Mypy is gradual**: strict only for `lerobot.envs`, `lerobot.configs`, `lerobot.optim`, `lerobot.model`, `lerobot.cameras`, `lerobot.motors`, `lerobot.transport`. Add type annotations when modifying these modules.
 - **Optional dependencies**: many policies, envs, and robots are behind extras (e.g., `lerobot[aloha]`). New imports for optional packages must be guarded or lazy. See `pyproject.toml [project.optional-dependencies]`.
 - **Video decoding**: datasets can store observations as video files. `LeRobotDataset` handles frame extraction, but tests need ffmpeg installed.
-- **Activate `.venv` before Python commands**: run `source .venv/bin/activate`, then use `python3`.
 
 ## Training Sample Weighting
-
 - Policy-agnostic weighting is configured at `TrainPipelineConfig.sample_weighting`; strategies and their
   dataclass fields live in `src/lerobot/utils/sample_weighting.py`.
 - `type=control_mode` reads the anchor frame's raw `observation.control_mode` before preprocessing and maps
@@ -75,3 +90,5 @@ pre-commit run --all-files                           # Lint + format (ruff, typo
 - Policies can implement `forward(batch, reduction="none")` for an efficient per-sample loss path. Policies
   exposing only a scalar mean loss remain supported through grouped forwards, one per distinct non-zero
   weight in the batch. Keep this compatibility path when adding weighting strategies or policies.
+- **Always use TorchCodec for video decoding.**
+- **Prioritize use of `uv run`** to execute Python commands (not raw `python` or `pip`).
