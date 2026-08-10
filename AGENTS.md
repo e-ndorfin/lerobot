@@ -2,30 +2,46 @@ This file provides guidance to AI agents when working with code in this reposito
 
 > **User-facing help → [`AGENT_GUIDE.md`](./AGENT_GUIDE.md)** (SO-101 setup, recording, picking a policy, training duration, eval — with copy-pasteable commands).
 
+# Most IMPORTANT information
+NEVER, and I mean NEVER, save model artifacts to WandB. I prefer to keep WandB online, but you must ONLY upload normal things like logs, loss, config etc. I only have 5GB. You cannot save ANY model artifacts to WandB.
+
+
+## Cluster Information
+See @CLUSTER.md for more information on the compute cluster this code is running on.
+
 ## Project Overview
 
 LeRobot is a PyTorch-based library for real-world robotics, providing datasets, pretrained policies, and tools for training, evaluation, data collection, and robot control. It integrates with Hugging Face Hub for model/dataset sharing.
 
 ## Tech Stack
 
-Python 3.12+ · PyTorch · Hugging Face (datasets, Hub, accelerate) · draccus (config/CLI) · Gymnasium (envs) · uv (package management)
+Python 3.12+ · PyTorch · Hugging Face (datasets, Hub, accelerate) · draccus (config/CLI) · Gymnasium (envs)
 
 ## Development Setup
 
 ```bash
-uv sync --locked                            # Base dependencies
-uv sync --locked --extra test --extra dev   # Test + dev tools
-uv sync --locked --extra all                # Everything
+source .venv/bin/activate                   # Activate the project environment
+python3 -m pip install -e .                 # Base dependencies
+python3 -m pip install -e ".[test,dev]"     # Test + dev tools
+python3 -m pip install -e ".[all]"          # Everything
 git lfs install && git lfs pull             # Test artifacts
 ```
 
 ## Key Commands
 
 ```bash
-uv run pytest tests -svv --maxfail=10                 # All tests
+source .venv/bin/activate                             # Activate the project environment
+python3 -m pytest tests -svv --maxfail=10             # All tests
 DEVICE=cuda make test-end-to-end                      # All E2E tests
 pre-commit run --all-files                           # Lint + format (ruff, typos, bandit, etc.)
 ```
+
+## Weights & Biases Storage
+
+- **Never upload models, checkpoints, training states, datasets, videos, or other agent-created artifacts to Weights & Biases.**
+- W&B may be used for scalar metrics and ordinary run metadata only. Do not enable artifact/model logging, call artifact upload APIs, or configure checkpoint synchronization.
+- Every agent-created LeRobot training command with W&B enabled must explicitly pass `--wandb.disable_artifact=true`; do not rely on its default value.
+- Do not push a model or any other artifact to W&B unless the user explicitly requests that specific upload, even when W&B is already enabled for metrics.
 
 ## Architecture (`src/lerobot/`)
 
@@ -46,7 +62,13 @@ pre-commit run --all-files                           # Lint + format (ruff, typo
 - **`examples/`** — End-user tutorials and scripts organized by use case (dataset creation, training, hardware setup).
 - **`docker/`** — Dockerfiles for user (`Dockerfile.user`) and CI (`Dockerfile.internal`).
 - **`benchmarks/`** — Performance benchmarking scripts.
-- **Root files**: `pyproject.toml` (single source of truth for deps, build, tool config), `Makefile` (E2E test targets), `uv.lock`, `CONTRIBUTING.md` & `README.md` (general information).
+- **Root files**: `pyproject.toml` (single source of truth for deps, build, tool config), `Makefile` (E2E test targets), `CONTRIBUTING.md` & `README.md` (general information).
+
+## Slurm Training DataLoader Defaults
+
+- Always reserve 20 CPUs for training jobs with `#SBATCH --cpus-per-task=20`.
+- Always configure training DataLoaders with `--num_workers=14`, `--prefetch_factor=4`, and
+  `--persistent_workers=true`.
 
 ## Notes
 
@@ -54,4 +76,23 @@ pre-commit run --all-files                           # Lint + format (ruff, typo
 - **Imports**: prefer top-level imports; relative (`from .sibling import X`) across sibling files within a module, absolute (`from lerobot.module import X`) across modules.
 - **Optional dependencies**: many policies, envs, and robots are behind extras (e.g., `lerobot[aloha]`, see `pyproject.toml`). Guard optional imports with `TYPE_CHECKING or _foo_available` at module top + a `require_package(...)` check at use time. Reuse the `_foo_available` flags in `utils/import_utils.py`; don't call `is_package_available`.
 - **Video decoding**: datasets can store observations as video files. `LeRobotDataset` handles frame extraction, but tests need ffmpeg installed.
+
+## Training Sample Weighting
+- Policy-agnostic weighting is configured at `TrainPipelineConfig.sample_weighting`; strategies and their
+  dataclass fields live in `src/lerobot/utils/sample_weighting.py`.
+- `type=control_mode` reads the anchor frame's raw `observation.control_mode` before preprocessing and maps
+  integer labels through `mode_weights`. It weights the whole BC loss for that sample/action chunk; it does
+  not assign separate weights to future actions inside the chunk. The control-mode convention is
+  0=Teleoperation (normal human-controlled motion), 1=Policy (robot action produced by the policy),
+  2=Intervention (human takes control during a policy rollout), 3=Return (automated rewind/return trajectory
+  before intervention; historically called replay internally), 4=Homing (robot automatically moves to its
+  home pose), and 5=Pre-rewind (configured interval immediately before Return begins). These are dataset
+  conventions rather than a LeRobot enum, so verify a new dataset before relying on them.
+- Example CLI flags: `--sample_weighting.type=control_mode`
+  `--sample_weighting.mode_weights='{"0":1.0,"1":0.5,"2":2.0,"4":0.0}'`. Omitted modes are errors unless
+  `--sample_weighting.default_weight` is set.
+- Policies can implement `forward(batch, reduction="none")` for an efficient per-sample loss path. Policies
+  exposing only a scalar mean loss remain supported through grouped forwards, one per distinct non-zero
+  weight in the batch. Keep this compatibility path when adding weighting strategies or policies.
+- **Always use TorchCodec for video decoding.**
 - **Prioritize use of `uv run`** to execute Python commands (not raw `python` or `pip`).

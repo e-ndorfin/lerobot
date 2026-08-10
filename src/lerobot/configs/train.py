@@ -175,7 +175,7 @@ class TrainPipelineConfig(HubMixin):
     # final model is pushed regardless. Works the same locally and remotely.
     save_checkpoint_to_hub: bool = False
 
-    # Sample weighting configuration (e.g., for RA-BC training)
+    # Per-anchor-frame loss weighting (e.g., RA-BC or dataset control-mode weighting).
     sample_weighting: SampleWeightingConfig | None = None
 
     # Rename map for the observation to override the image and state keys

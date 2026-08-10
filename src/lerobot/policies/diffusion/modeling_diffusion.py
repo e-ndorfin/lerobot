@@ -160,15 +160,17 @@ class DiffusionPolicy(PreTrainedPolicy):
         action = self._queues[ACTION].popleft()
         return action
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
+    def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, None]:
         """Run the batch through the model and compute the loss for training or validation."""
+        if reduction not in {"mean", "none"}:
+            raise ValueError(f"Unsupported reduction={reduction!r}. Expected 'mean' or 'none'.")
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             for key in self.config.image_features:
                 if self.config.n_obs_steps == 1 and batch[key].ndim == 4:
                     batch[key] = batch[key].unsqueeze(1)
             batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
-        loss = self.diffusion.compute_loss(batch)
+        loss = self.diffusion.compute_loss(batch, reduction=reduction)
         # no output_dict so returning None
         return loss, None
 
@@ -332,7 +334,7 @@ class DiffusionModel(nn.Module):
 
         return actions
 
-    def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
+    def compute_loss(self, batch: dict[str, Tensor], reduction: str = "mean") -> Tensor:
         """
         This function expects `batch` to have (at least):
         {
@@ -394,9 +396,14 @@ class DiffusionModel(nn.Module):
                 )
             in_episode_bound = ~batch["action_is_pad"]
             mask = in_episode_bound.unsqueeze(-1)
+            if reduction == "none":
+                num_valid = mask.sum(dim=(1, 2)) * loss.shape[-1]
+                return (loss * mask).sum(dim=(1, 2)) / num_valid.clamp_min(1)
             num_valid = mask.sum() * loss.shape[-1]
             return (loss * mask).sum() / num_valid.clamp_min(1)
 
+        if reduction == "none":
+            return loss.mean(dim=(1, 2))
         return loss.mean()
 
 

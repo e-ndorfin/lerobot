@@ -22,6 +22,7 @@ venv.bak/
 .python-version
 __pypackages__/
 node_modules/
+*.sbatch
 
 # Lock files
 poetry.lock
@@ -154,6 +155,7 @@ dmypy.json
 nautilus/*.yaml
 *.key
 sbatch*.sh
+/slurm_logs/
 
 ### Miscellaneous ###
 # W&B

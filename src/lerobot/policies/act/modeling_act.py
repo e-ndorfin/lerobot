@@ -136,8 +136,10 @@ class ACTPolicy(PreTrainedPolicy):
         actions = self.model(batch)[0]
         return actions
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict]:
+    def forward(self, batch: dict[str, Tensor], reduction: str = "mean") -> tuple[Tensor, dict]:
         """Run the batch through the model and compute the loss for training or validation."""
+        if reduction not in {"mean", "none"}:
+            raise ValueError(f"Unsupported reduction={reduction!r}. Expected 'mean' or 'none'.")
         if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch[OBS_IMAGES] = [batch[key] for key in self.config.image_features]
@@ -148,6 +150,8 @@ class ACTPolicy(PreTrainedPolicy):
         valid_mask = ~batch["action_is_pad"].unsqueeze(-1)
         num_valid = valid_mask.sum() * abs_err.shape[-1]
         l1_loss = (abs_err * valid_mask).sum() / num_valid.clamp_min(1)
+        per_sample_num_valid = valid_mask.sum(dim=(1, 2)) * abs_err.shape[-1]
+        per_sample_l1_loss = (abs_err * valid_mask).sum(dim=(1, 2)) / per_sample_num_valid.clamp_min(1)
 
         loss_dict = {"l1_loss": l1_loss.item()}
         if self.config.use_vae and log_sigma_x2_hat is not None:
@@ -155,13 +159,17 @@ class ACTPolicy(PreTrainedPolicy):
             # each dimension independently, we sum over the latent dimension to get the total
             # KL-divergence per batch element, then take the mean over the batch.
             # (See App. B of https://huggingface.co/papers/1312.6114 for more details).
-            mean_kld = (
-                (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(-1).mean()
+            per_sample_kld = (-0.5 * (1 + log_sigma_x2_hat - mu_hat.pow(2) - (log_sigma_x2_hat).exp())).sum(
+                -1
             )
+            mean_kld = per_sample_kld.mean()
             loss_dict["kld_loss"] = mean_kld.item()
-            loss = l1_loss + mean_kld * self.config.kl_weight
+            if reduction == "none":
+                loss = per_sample_l1_loss + per_sample_kld * self.config.kl_weight
+            else:
+                loss = l1_loss + mean_kld * self.config.kl_weight
         else:
-            loss = l1_loss
+            loss = per_sample_l1_loss if reduction == "none" else l1_loss
 
         return loss, loss_dict
 
