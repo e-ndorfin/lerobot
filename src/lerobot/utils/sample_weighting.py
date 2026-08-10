@@ -325,11 +325,16 @@ class ControlModeWeighter(SampleWeighter):
         modes = torch.as_tensor(batch[self.control_mode_key]).detach()
         if modes.ndim == 0:
             modes = modes.unsqueeze(0)
-        if modes.ndim == 2 and modes.shape[1] == 1:
-            modes = modes[:, 0]
+        # Observation features can include a temporal dimension. LeRobot orders
+        # observation deltas chronologically and the final entry is delta 0, so
+        # weight the action chunk using the current (anchor) frame's mode.
+        if modes.ndim == 3 and modes.shape[-1] == 1:
+            modes = modes.squeeze(-1)
+        if modes.ndim == 2:
+            modes = modes[:, -1]
         if modes.ndim != 1:
             raise ValueError(
-                f"{self.control_mode_key} must contain one scalar label per sample, "
+                f"{self.control_mode_key} must contain one scalar label per sample or timestep, "
                 f"got shape {tuple(modes.shape)}"
             )
         if not torch.isfinite(modes).all():

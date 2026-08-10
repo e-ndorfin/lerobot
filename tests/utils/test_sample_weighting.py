@@ -236,6 +236,23 @@ def test_control_mode_weighter_accepts_singleton_feature_dimension():
     assert weights.sum().item() == pytest.approx(2.0)
 
 
+@pytest.mark.parametrize(
+    "modes",
+    [
+        torch.tensor([[5.0, 0.0], [5.0, 2.0]]),
+        torch.tensor([[[5.0], [0.0]], [[5.0], [2.0]]]),
+    ],
+)
+def test_control_mode_weighter_uses_anchor_mode_from_temporal_observations(modes):
+    weighter = ControlModeWeighter(mode_weights={0: 1.0, 2: 2.0}, device=torch.device("cpu"))
+
+    weights, stats = weighter.compute_batch_weights({CONTROL_MODE_KEY: modes})
+
+    assert torch.allclose(weights, torch.tensor([2 / 3, 4 / 3]))
+    assert stats["mode_0_count"] == 1
+    assert stats["mode_2_count"] == 1
+
+
 def test_control_mode_weighter_uses_explicit_default_weight():
     weighter = ControlModeWeighter(
         mode_weights={0: 1.0},
@@ -260,7 +277,7 @@ def test_control_mode_weighter_rejects_unknown_mode_without_default():
     [
         ({}, "requires raw batch feature"),
         ({CONTROL_MODE_KEY: torch.tensor([0.5])}, "non-integer labels"),
-        ({CONTROL_MODE_KEY: torch.tensor([[0.0, 1.0]])}, "one scalar label per sample"),
+        ({CONTROL_MODE_KEY: torch.zeros(1, 2, 2)}, "one scalar label per sample or timestep"),
     ],
 )
 def test_control_mode_weighter_rejects_invalid_batch(batch, error):
