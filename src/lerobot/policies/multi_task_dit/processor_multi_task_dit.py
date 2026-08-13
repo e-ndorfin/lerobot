@@ -19,8 +19,10 @@ from typing import Any
 import torch
 
 from lerobot.processor import (
+    AbsoluteActionsProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
+    RelativeActionsProcessorStep,
     TokenizerProcessorStep,
     make_default_policy_processor_steps,
     make_policy_processor_pipelines,
@@ -62,6 +64,14 @@ def make_multi_task_dit_pre_post_processors(
 
     steps = make_default_policy_processor_steps(config, dataset_stats, normalizer_device=config.device)
 
+    relative_step = RelativeActionsProcessorStep(
+        enabled=config.use_relative_actions,
+        exclude_joints=config.relative_exclude_joints,
+        action_names=config.action_feature_names,
+        reference_state_index=-1,
+        reference_state_indices=config.relative_state_indices,
+    )
+
     input_steps = [
         steps.rename_observations,
         steps.add_batch_dim,
@@ -73,10 +83,12 @@ def make_multi_task_dit_pre_post_processors(
             truncation=config.tokenizer_truncation,
         ),
         steps.to_device,
+        relative_step,
         steps.normalize,
     ]
     output_steps = [
         steps.unnormalize,
+        AbsoluteActionsProcessorStep(enabled=config.use_relative_actions, relative_step=relative_step),
         steps.to_cpu,
     ]
 

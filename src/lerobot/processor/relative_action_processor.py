@@ -101,7 +101,52 @@ class RelativeActionsProcessorStep(ProcessorStep):
     enabled: bool = False
     exclude_joints: list[str] = field(default_factory=list)
     action_names: list[str] | None = None
+    # Temporal state row used as the action anchor. This is useful for policies
+    # whose training batches contain observation history, e.g. [B, T_obs, D].
+    # It is deliberately ignored for ordinary [B, D] inference observations.
+    reference_state_index: int | None = None
+    # Optional mapping from action dimensions to state dimensions. Without a
+    # mapping, action i is anchored to state i (the historical behavior).
+    reference_state_indices: list[int] | None = None
     _last_state: torch.Tensor | None = field(default=None, init=False, repr=False)
+
+    def _select_reference_state(self, state: torch.Tensor, action_dim: int | None = None) -> torch.Tensor:
+        """Return the state vector whose coordinates correspond to action dimensions."""
+        reference = state
+        if self.reference_state_index is not None and reference.ndim >= 3:
+            try:
+                reference = reference.select(-2, self.reference_state_index)
+            except IndexError as exc:
+                raise ValueError(
+                    f"reference_state_index={self.reference_state_index} is out of range for "
+                    f"state shape {tuple(state.shape)}"
+                ) from exc
+
+        if self.reference_state_indices is not None:
+            if action_dim is not None and len(self.reference_state_indices) < action_dim:
+                raise ValueError(
+                    "reference_state_indices must provide at least one state index per action dimension: "
+                    f"got {len(self.reference_state_indices)} indices for action_dim={action_dim}"
+                )
+            indices = self.reference_state_indices
+            if action_dim is not None:
+                indices = indices[:action_dim]
+            if indices:
+                min_index = min(indices)
+                max_index = max(indices)
+                if min_index < 0 or max_index >= reference.shape[-1]:
+                    raise ValueError(
+                        f"reference_state_indices={indices} are incompatible with state shape "
+                        f"{tuple(reference.shape)}"
+                    )
+                index_tensor = torch.tensor(indices, dtype=torch.long, device=reference.device)
+                reference = reference.index_select(-1, index_tensor)
+
+        if action_dim is not None and reference.shape[-1] < action_dim:
+            raise ValueError(
+                f"Reference state has {reference.shape[-1]} dimensions but action has {action_dim} dimensions"
+            )
+        return reference
 
     def _build_mask(self, action_dim: int) -> list[bool]:
         if not self.exclude_joints or self.action_names is None:
@@ -126,20 +171,26 @@ class RelativeActionsProcessorStep(ProcessorStep):
         observation = transition.get(TransitionKey.OBSERVATION, {})
         state = observation.get(OBS_STATE) if observation else None
 
-        # Always cache state for the paired AbsoluteActionsProcessorStep
+        action = transition.get(TransitionKey.ACTION)
+        action_dim = action.shape[-1] if action is not None else None
+
+        # Always cache the selected state for the paired AbsoluteActionsProcessorStep.
+        # At inference there is no action in the preprocessor input, so retain the
+        # full configured mapping rather than inferring the width from an action.
         if state is not None:
-            self._last_state = state
+            configured_dim = len(self.reference_state_indices) if self.reference_state_indices else action_dim
+            self._last_state = self._select_reference_state(state, configured_dim)
 
         if not self.enabled:
             return transition
 
         new_transition = transition.copy()
-        action = new_transition.get(TransitionKey.ACTION)
         if action is None or state is None:
             return new_transition
 
         mask = self._build_mask(action.shape[-1])
-        new_transition[TransitionKey.ACTION] = to_relative_actions(action, state, mask)
+        reference_state = self._select_reference_state(state, action.shape[-1])
+        new_transition[TransitionKey.ACTION] = to_relative_actions(action, reference_state, mask)
         return new_transition
 
     def get_cached_state(self) -> torch.Tensor | None:
@@ -151,6 +202,8 @@ class RelativeActionsProcessorStep(ProcessorStep):
             "enabled": self.enabled,
             "exclude_joints": self.exclude_joints,
             "action_names": self.action_names,
+            "reference_state_index": self.reference_state_index,
+            "reference_state_indices": self.reference_state_indices,
         }
 
     def transform_features(

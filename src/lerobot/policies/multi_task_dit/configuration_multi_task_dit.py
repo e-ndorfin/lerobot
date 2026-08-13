@@ -34,6 +34,14 @@ class MultiTaskDiTConfig(PreTrainedConfig):
     horizon: int = 32  # Number of action steps to predict
     n_action_steps: int = 24  # Actions executed per policy call (~0.8s at 30Hz)
 
+    # Relative actions. Multi-task datasets commonly concatenate richer state
+    # vectors (position/velocity/effort), so relative_state_indices explicitly
+    # maps each action dimension to the position used as its anchor.
+    use_relative_actions: bool = False
+    relative_exclude_joints: list[str] = field(default_factory=list)
+    relative_state_indices: list[int] | None = None
+    action_feature_names: list[str] | None = None
+
     # Objective Selection
     objective: str = "diffusion"  # "diffusion" or "flow_matching"
 
