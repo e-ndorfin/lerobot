@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from lerobot.configs import NormalizationMode, PreTrainedConfig
 from lerobot.optim import AdamConfig, DiffuserSchedulerConfig
 
+from ..rtc.configuration_rtc import RTCConfig
+
 
 @PreTrainedConfig.register_subclass("multi_task_dit")
 @dataclass
@@ -55,6 +57,11 @@ class MultiTaskDiTConfig(PreTrainedConfig):
     clip_sample: bool = True  # Clip samples during denoising
     clip_sample_range: float = 1.0  # Clipping range [-x, x]
     num_inference_steps: int | None = None  # Denoising steps at inference (defaults to num_train_timesteps)
+
+    # Optional inference-time Real-Time Chunking guidance. Diffusion checkpoints
+    # are converted to an SNR-matched optimal-transport path without retraining;
+    # flow-matching checkpoints use their native conditional optimal-transport path.
+    rtc_config: RTCConfig | None = None
 
     # --- Flow Matching-specific (used when objective="flow_matching") ---
     sigma_min: float = 0.0  # Minimum noise in flow interpolation path

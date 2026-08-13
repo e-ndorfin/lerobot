@@ -21,10 +21,13 @@ Supports both diffusion and flow matching objectives for action generation.
 
 References:
 - https://arxiv.org/abs/2507.05331
+- https://arxiv.org/abs/2310.04432
+- https://arxiv.org/abs/2506.07339
 - https://bostondynamics.com/blog/large-behavior-models-atlas-find-new-footing/
 - https://brysonkjones.substack.com/p/dissecting-and-open-sourcing-multitask-diffusion-transformer-policy
 """
 
+import logging
 import math
 from collections import deque
 from typing import TYPE_CHECKING
@@ -62,7 +65,10 @@ from lerobot.utils.constants import (
 )
 
 from ..pretrained import PreTrainedPolicy
+from ..rtc.modeling_rtc import RTCProcessor
 from ..utils import populate_queues
+
+logger = logging.getLogger(__name__)
 
 # -- Policy --
 
@@ -71,12 +77,16 @@ class MultiTaskDiTPolicy(PreTrainedPolicy):
     config_class = MultiTaskDiTConfig
     name = "multi_task_dit"
 
+    def supports_rtc(self) -> bool:
+        return self.config.is_diffusion or self.config.is_flow_matching
+
     def __init__(self, config: MultiTaskDiTConfig, **kwargs):
         require_package("transformers", extra="multi_task_dit")
         require_package("diffusers", extra="multi_task_dit")
         super().__init__(config)
         config.validate_features()
         self.config = config
+        self.init_rtc_processor()
 
         self._queues = None
 
@@ -106,6 +116,12 @@ class MultiTaskDiTPolicy(PreTrainedPolicy):
 
         self.reset()
 
+    def init_rtc_processor(self):
+        """Create the shared RTC guidance helper when configured."""
+        self.rtc_processor = None
+        if self.config.rtc_config is not None:
+            self.rtc_processor = RTCProcessor(self.config.rtc_config)
+
     def get_optim_params(self) -> list:
         """Returns parameter groups with different learning rates for vision vs non-vision parameters"""
         non_vision_params = []
@@ -128,12 +144,31 @@ class MultiTaskDiTPolicy(PreTrainedPolicy):
             },
         ]
 
-    def _generate_actions(self, batch: dict[str, Tensor]) -> Tensor:
+    def _generate_actions(self, batch: dict[str, Tensor], **rtc_kwargs) -> Tensor:
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
         assert n_obs_steps == self.config.n_obs_steps
 
         conditioning_vec = self.observation_encoder.encode(batch)
-        actions = self.objective.conditional_sample(self.noise_predictor, batch_size, conditioning_vec)
+        if self.config.is_diffusion:
+            actions = self.objective.conditional_sample(
+                self.noise_predictor,
+                batch_size,
+                conditioning_vec,
+                rtc_processor=self.rtc_processor,
+                action_start=n_obs_steps - 1,
+                action_steps=self.config.n_action_steps,
+                **rtc_kwargs,
+            )
+        else:
+            actions = self.objective.conditional_sample(
+                self.noise_predictor,
+                batch_size,
+                conditioning_vec,
+                rtc_processor=self.rtc_processor,
+                action_start=n_obs_steps - 1,
+                action_steps=self.config.n_action_steps,
+                **rtc_kwargs,
+            )
 
         start = n_obs_steps - 1
         end = start + self.config.n_action_steps
@@ -151,16 +186,69 @@ class MultiTaskDiTPolicy(PreTrainedPolicy):
             self._queues[OBS_IMAGES] = deque(maxlen=self.config.n_obs_steps)
 
     @torch.no_grad()
-    def predict_action_chunk(self, batch: dict[str, Tensor]) -> Tensor:
+    def predict_action_chunk(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        inference_delay: int = 0,
+        prev_chunk_left_over: Tensor | None = None,
+        execution_horizon: int | None = None,
+    ) -> Tensor:
         """Predict a chunk of actions given environment observations"""
         self.eval()
 
+        if self.config.image_features and OBS_IMAGES not in batch:
+            batch = self._prepare_batch(batch)
+
         for k in batch:
-            if k in self._queues:
+            if k in self._queues and self._queues[k]:
                 batch[k] = torch.stack(list(self._queues[k]), dim=1)
 
-        actions = self._generate_actions(batch)
+        actions = self._generate_actions(
+            batch,
+            inference_delay=inference_delay,
+            prev_chunk_left_over=prev_chunk_left_over,
+            execution_horizon=execution_horizon,
+        )
         return actions
+
+    @torch.no_grad()
+    def sample_full_action_horizon(
+        self,
+        batch: dict[str, Tensor],
+        *,
+        num_samples: int,
+    ) -> Tensor:
+        """Draw independent full-horizon samples for offline inspection.
+
+        Unlike :meth:`predict_action_chunk`, this deliberately returns the
+        complete diffusion horizon before the observation-alignment prefix and
+        non-executable tail are removed.  The observation encoder is evaluated
+        once, then its conditioning is expanded across samples.  This keeps
+        offline ensemble generation from redundantly encoding the same camera
+        images ``num_samples`` times.
+        """
+
+        if num_samples <= 0:
+            raise ValueError("num_samples must be positive")
+        self.eval()
+        if self.config.image_features and OBS_IMAGES not in batch:
+            batch = self._prepare_batch(batch)
+
+        conditioning_vec = self.observation_encoder.encode(batch)
+        if conditioning_vec.shape[0] != 1:
+            raise ValueError(
+                "offline sampling expects exactly one conditioning observation, "
+                f"got batch size {conditioning_vec.shape[0]}"
+            )
+        conditioning_vec = conditioning_vec.expand(int(num_samples), *conditioning_vec.shape[1:])
+        return self.objective.conditional_sample(
+            self.noise_predictor,
+            int(num_samples),
+            conditioning_vec,
+            action_start=self.config.n_obs_steps - 1,
+            action_steps=self.config.n_action_steps,
+        )
 
     def _prepare_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         """Prepare batch by stacking image features if needed."""
@@ -694,26 +782,319 @@ class DiffusionObjective(nn.Module):
 
         return loss.mean()
 
-    def conditional_sample(self, model: nn.Module, batch_size: int, conditioning_vec: Tensor) -> Tensor:
-        device = next(model.parameters()).device
-        dtype = next(model.parameters()).dtype
+    def conditional_sample(
+        self,
+        model: nn.Module,
+        batch_size: int,
+        conditioning_vec: Tensor,
+        *,
+        rtc_processor: RTCProcessor | None = None,
+        inference_delay: int = 0,
+        prev_chunk_left_over: Tensor | None = None,
+        execution_horizon: int | None = None,
+        action_start: int = 0,
+        action_steps: int | None = None,
+    ) -> Tensor:
+        model_parameter = next(model.parameters())
+        device = model_parameter.device
+        dtype = model_parameter.dtype
+        rtc_enabled = (
+            rtc_processor is not None
+            and rtc_processor.rtc_config.enabled
+            and prev_chunk_left_over is not None
+        )
 
+        if rtc_enabled:
+            return self._conditional_sample_rtc_flow(
+                model,
+                batch_size,
+                conditioning_vec,
+                rtc_processor=rtc_processor,
+                inference_delay=inference_delay,
+                prev_chunk_left_over=prev_chunk_left_over,
+                execution_horizon=execution_horizon,
+                action_start=action_start,
+                action_steps=action_steps or self.horizon,
+            )
+
+        # Preserve the checkpoint's ordinary DDPM/DDIM inference path exactly
+        # when RTC is not requested.
         sample = torch.randn(
             size=(batch_size, self.horizon, self.action_dim),
             dtype=dtype,
             device=device,
         )
-
         self.noise_scheduler.set_timesteps(self.num_inference_steps)
+
         for t in self.noise_scheduler.timesteps:
+            timestep = int(t.item()) if isinstance(t, Tensor) else int(t)
             model_output = model(
                 sample,
-                torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
+                torch.full(sample.shape[:1], timestep, dtype=torch.long, device=sample.device),
                 conditioning_vec=conditioning_vec,
             )
-            sample = self.noise_scheduler.step(model_output, t, sample).prev_sample
+            sample = self.noise_scheduler.step(model_output, timestep, sample).prev_sample
 
         return sample
+
+    def _conditional_sample_rtc_flow(
+        self,
+        model: nn.Module,
+        batch_size: int,
+        conditioning_vec: Tensor,
+        *,
+        rtc_processor: RTCProcessor,
+        inference_delay: int,
+        prev_chunk_left_over: Tensor,
+        execution_horizon: int | None,
+        action_start: int,
+        action_steps: int,
+    ) -> Tensor:
+        """Sample a diffusion checkpoint through its SNR-matched optimal-transport path.
+
+        The checkpoint remains an epsilon/sample-prediction diffusion model.  At
+        each discrete diffusion timestep ``tau`` we map its VP path to flow time
+        ``t = alpha / (alpha + sigma)``, rescale the flow state before the model
+        call, recover the scheduler-consistent clean estimate, and integrate the
+        RTC-guided velocity with the actual non-uniform flow-time interval.
+
+        This is the discrete analogue of Pokle et al. (2023), equations 9--10.
+        It deliberately does not call ``Scheduler.step`` or extrapolate a model
+        evaluation outside the diffusion checkpoint's trained timestep range.
+        """
+        model_parameter = next(model.parameters())
+        device = model_parameter.device
+        model_dtype = model_parameter.dtype
+        solver_dtype = torch.float32 if model_dtype in (torch.float16, torch.bfloat16) else model_dtype
+
+        timesteps, flow_times, alphas, sigmas = self._rtc_flow_schedule(device=device, dtype=solver_dtype)
+        initial_scale = alphas[0] + sigmas[0]
+        init_noise_sigma = float(getattr(self.noise_scheduler, "init_noise_sigma", 1.0))
+        sample = torch.randn(
+            size=(batch_size, self.horizon, self.action_dim),
+            dtype=solver_dtype,
+            device=device,
+        )
+        # The trained schedule stops at finite SNR.  As in ordinary diffusion
+        # sampling, z_T is approximated by the Gaussian prior; converting it to
+        # the conditional optimal-transport coordinate gives the supported
+        # starting state.
+        sample = sample.mul(init_noise_sigma).div(initial_scale)
+
+        start_time = float(flow_times[0].item())
+        if start_time > 0.01:
+            logger.warning(
+                "RTC diffusion-to-flow conversion starts at finite flow time %.6f "
+                "(diffusion timestep %d); the Gaussian prior approximation may be inaccurate",
+                start_time,
+                int(timesteps[0].item()),
+            )
+
+        target, weights = self._rtc_target_and_weights(
+            sample,
+            prev_chunk_left_over,
+            rtc_processor,
+            inference_delay=inference_delay,
+            execution_horizon=execution_horizon,
+            action_start=action_start,
+            action_steps=action_steps,
+        )
+
+        detached_conditioning = conditioning_vec.detach()
+        for step_index, timestep_tensor in enumerate(timesteps):
+            timestep = int(timestep_tensor.item())
+            flow_time = flow_times[step_index]
+            alpha = alphas[step_index]
+            sigma = sigmas[step_index]
+            scale = alpha + sigma
+
+            with torch.enable_grad():
+                flow_state = sample.detach().requires_grad_(True)
+                diffusion_state = (scale * flow_state).to(dtype=model_dtype)
+                model_output = model(
+                    diffusion_state,
+                    torch.full(diffusion_state.shape[:1], timestep, dtype=torch.long, device=device),
+                    conditioning_vec=detached_conditioning,
+                ).to(dtype=solver_dtype)
+
+                prediction_type = self.noise_scheduler.config.prediction_type
+                if prediction_type == "epsilon":
+                    clean_estimate = (diffusion_state.to(solver_dtype) - sigma * model_output) / alpha
+                elif prediction_type == "sample":
+                    clean_estimate = model_output
+                else:
+                    raise ValueError(f"Diffusion RTC does not support prediction type {prediction_type!r}")
+
+                raw_clean_estimate = clean_estimate
+                if self.noise_scheduler.config.thresholding:
+                    clean_estimate = self.noise_scheduler._threshold_sample(clean_estimate)
+                elif self.noise_scheduler.config.clip_sample:
+                    clean_estimate = clean_estimate.clamp(
+                        -self.noise_scheduler.config.clip_sample_range,
+                        self.noise_scheduler.config.clip_sample_range,
+                    )
+
+                one_minus_time = 1.0 - flow_time
+                base_velocity = (clean_estimate - flow_state) / one_minus_time
+                error = (target - clean_estimate) * weights
+                correction = torch.autograd.grad(
+                    clean_estimate,
+                    flow_state,
+                    grad_outputs=error.detach(),
+                    retain_graph=False,
+                )[0]
+
+            next_time = flow_times[step_index + 1] if step_index + 1 < len(flow_times) else 1.0
+            delta_time = next_time - flow_time
+            guidance_weight = self._rtc_guidance_weight(
+                float(flow_time.item()), rtc_processor.rtc_config.max_guidance_weight
+            )
+            guidance_delta = delta_time * guidance_weight * correction
+            guidance_delta_rms = guidance_delta.square().mean(dim=(-2, -1), keepdim=True).sqrt()
+            max_guidance_step_rms = rtc_processor.rtc_config.diffusion_max_guidance_step_rms
+            guidance_scale = (max_guidance_step_rms / guidance_delta_rms.clamp_min(1e-12)).clamp(max=1.0)
+            bounded_guidance_delta = guidance_scale * guidance_delta
+            # The terminal interval is intentionally guided.  For the base
+            # velocity alone this is the raw x_1 projection; retaining the VJP
+            # term matches RTC Algorithm 1's final Euler step.
+            sample = (flow_state + delta_time * base_velocity + bounded_guidance_delta).detach()
+
+            if rtc_processor.is_debug_enabled():
+                rtc_processor.track(
+                    time=flow_time,
+                    x_t=flow_state,
+                    v_t=base_velocity,
+                    x1_t=clean_estimate,
+                    correction=correction,
+                    err=error,
+                    weights=weights,
+                    guidance_weight=guidance_weight,
+                    inference_delay=inference_delay,
+                    execution_horizon=execution_horizon,
+                    diffusion_timestep=timestep,
+                    flow_delta=delta_time,
+                    raw_clean_abs_max=raw_clean_estimate.detach().abs().max(),
+                    guidance_delta_rms=guidance_delta_rms.detach().flatten(),
+                    guidance_scale=guidance_scale.detach().flatten(),
+                    time_convention="noise_to_data",
+                )
+
+        return sample.to(dtype=model_dtype)
+
+    def _rtc_flow_schedule(
+        self, *, device: torch.device, dtype: torch.dtype
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Return discrete diffusion timesteps ordered by increasing flow time.
+
+        Requested inference points are selected approximately uniformly in the
+        converted flow time while always retaining both trained endpoints.  This
+        avoids Diffusers timestep grids that can omit the highest-noise step.
+        """
+        alphas_cumprod = self.noise_scheduler.alphas_cumprod.detach().to(device="cpu", dtype=torch.float64)
+        train_steps = len(alphas_cumprod)
+        if self.num_inference_steps < 2:
+            raise ValueError("Diffusion RTC requires at least two inference steps")
+        if self.num_inference_steps > train_steps:
+            raise ValueError(
+                "Diffusion RTC inference steps cannot exceed trained timesteps: "
+                f"{self.num_inference_steps} > {train_steps}"
+            )
+
+        all_alphas = alphas_cumprod.sqrt()
+        all_sigmas = (1.0 - alphas_cumprod).clamp_min(0).sqrt()
+        all_flow_times = all_alphas / (all_alphas + all_sigmas)
+
+        if self.num_inference_steps == train_steps:
+            selected = list(range(train_steps - 1, -1, -1))
+        else:
+            targets = torch.linspace(all_flow_times[-1], all_flow_times[0], self.num_inference_steps)
+            selected = [train_steps - 1]
+            for position in range(1, self.num_inference_steps - 1):
+                # Leave enough lower indices for all remaining points, including 0.
+                min_index = self.num_inference_steps - 1 - position
+                max_index = selected[-1] - 1
+                candidates = torch.arange(min_index, max_index + 1)
+                nearest = torch.argmin((all_flow_times[candidates] - targets[position]).abs())
+                selected.append(int(candidates[nearest]))
+            selected.append(0)
+
+        timesteps = torch.tensor(selected, dtype=torch.long, device=device)
+        selected_cpu = timesteps.cpu()
+        alphas = all_alphas[selected_cpu].to(device=device, dtype=dtype)
+        sigmas = all_sigmas[selected_cpu].to(device=device, dtype=dtype)
+        flow_times = alphas / (alphas + sigmas)
+        return timesteps, flow_times, alphas, sigmas
+
+    @staticmethod
+    def _rtc_guidance_weight(progress: float, max_guidance_weight: float) -> float:
+        """Clipped PiGDM guidance coefficient for noise-to-data progress."""
+        if progress <= 0.0 or progress >= 1.0:
+            return float(max_guidance_weight)
+        one_minus = 1.0 - progress
+        r_squared = one_minus**2 / (progress**2 + one_minus**2)
+        return min(float(max_guidance_weight), one_minus / (progress * r_squared))
+
+    @staticmethod
+    def _rtc_target_and_weights(
+        sample: Tensor,
+        prev_chunk_left_over: Tensor,
+        rtc_processor: RTCProcessor,
+        *,
+        inference_delay: int,
+        execution_horizon: int | None,
+        action_start: int,
+        action_steps: int,
+    ) -> tuple[Tensor, Tensor]:
+        """Place the executable action tail at its offset in the diffusion horizon."""
+        if inference_delay < 0:
+            raise ValueError(f"inference_delay must be non-negative, got {inference_delay}")
+        if action_start < 0 or action_start >= sample.shape[1]:
+            raise ValueError(
+                f"action_start must index the sample horizon, got {action_start} for {sample.shape[1]}"
+            )
+
+        previous = prev_chunk_left_over
+        if previous.ndim == 2:
+            previous = previous.unsqueeze(0)
+        if previous.ndim != 3:
+            raise ValueError(
+                f"prev_chunk_left_over must have shape [T, A] or [B, T, A], got {tuple(previous.shape)}"
+            )
+        previous = previous.to(device=sample.device, dtype=sample.dtype)
+        if previous.shape[0] == 1 and sample.shape[0] > 1:
+            previous = previous.expand(sample.shape[0], -1, -1)
+        if previous.shape[0] != sample.shape[0]:
+            raise ValueError(
+                "prev_chunk_left_over batch size must match the sampled batch: "
+                f"{previous.shape[0]} != {sample.shape[0]}"
+            )
+
+        available_steps = max(0, min(action_steps, sample.shape[1] - action_start))
+        overlap = min(previous.shape[1], available_steps)
+        action_dim = min(previous.shape[2], sample.shape[2])
+        overlap_end = min(
+            overlap,
+            int(execution_horizon) if execution_horizon is not None else overlap,
+        )
+        if inference_delay > overlap_end:
+            raise ValueError(
+                "RTC timing is infeasible: inference_delay must not exceed the overlapping "
+                f"prefix horizon ({inference_delay} > {overlap_end})"
+            )
+
+        target = torch.zeros_like(sample)
+        target[:, action_start : action_start + overlap, :action_dim] = previous[:, :overlap, :action_dim]
+
+        action_weights = rtc_processor.get_prefix_weights(
+            start=max(0, int(inference_delay)),
+            end=max(0, overlap_end),
+            total=available_steps,
+        ).to(device=sample.device, dtype=sample.dtype)
+        weights = torch.zeros_like(sample)
+        weights[:, action_start : action_start + available_steps, :] = action_weights.view(
+            1, available_steps, 1
+        )
+        return target, weights
 
 
 class FlowMatchingObjective(nn.Module):
@@ -759,7 +1140,19 @@ class FlowMatchingObjective(nn.Module):
 
         return loss.mean()
 
-    def conditional_sample(self, model: nn.Module, batch_size: int, conditioning_vec: Tensor) -> Tensor:
+    def conditional_sample(
+        self,
+        model: nn.Module,
+        batch_size: int,
+        conditioning_vec: Tensor,
+        *,
+        rtc_processor: RTCProcessor | None = None,
+        inference_delay: int = 0,
+        prev_chunk_left_over: Tensor | None = None,
+        execution_horizon: int | None = None,
+        action_start: int = 0,
+        action_steps: int | None = None,
+    ) -> Tensor:
         device = next(model.parameters()).device
         dtype = next(model.parameters()).dtype
 
@@ -767,47 +1160,147 @@ class FlowMatchingObjective(nn.Module):
 
         num_steps = self.config.num_integration_steps
         time_grid = torch.linspace(0, 1, num_steps + 1, device=device)
+        rtc_enabled = (
+            rtc_processor is not None
+            and rtc_processor.rtc_config.enabled
+            and prev_chunk_left_over is not None
+        )
+
+        dynamics = None
+        if rtc_enabled:
+            target, weights = DiffusionObjective._rtc_target_and_weights(
+                x,
+                prev_chunk_left_over,
+                rtc_processor,
+                inference_delay=inference_delay,
+                execution_horizon=execution_horizon,
+                action_start=action_start,
+                action_steps=action_steps or self.horizon,
+            )
+            detached_conditioning = conditioning_vec.detach()
+
+            def dynamics(x_val: Tensor, t_scalar: float) -> Tensor:
+                return self._rtc_guided_velocity(
+                    model,
+                    x_val,
+                    t_scalar,
+                    detached_conditioning,
+                    target=target,
+                    weights=weights,
+                    rtc_processor=rtc_processor,
+                    inference_delay=inference_delay,
+                    execution_horizon=execution_horizon,
+                )
 
         if self.config.integration_method == "euler":
-            x = self._euler_integrate(model, x, time_grid, conditioning_vec)
+            x = self._euler_integrate(model, x, time_grid, conditioning_vec, dynamics=dynamics)
         elif self.config.integration_method == "rk4":
-            x = self._rk4_integrate(model, x, time_grid, conditioning_vec)
+            x = self._rk4_integrate(model, x, time_grid, conditioning_vec, dynamics=dynamics)
         else:
             raise ValueError(f"Unknown integration method: {self.config.integration_method}")
 
         return x
 
+    def _rtc_guided_velocity(
+        self,
+        model: nn.Module,
+        flow_state: Tensor,
+        flow_time: float,
+        conditioning_vec: Tensor,
+        *,
+        target: Tensor,
+        weights: Tensor,
+        rtc_processor: RTCProcessor,
+        inference_delay: int,
+        execution_horizon: int | None,
+    ) -> Tensor:
+        """Apply RTC prefix guidance to the native noise-to-action velocity field."""
+        with torch.enable_grad():
+            flow_state = flow_state.detach().requires_grad_(True)
+            time_batch = torch.full(
+                (flow_state.shape[0],), flow_time, dtype=flow_state.dtype, device=flow_state.device
+            )
+            base_velocity = model(flow_state, time_batch, conditioning_vec=conditioning_vec)
+            action_estimate = flow_state + (1.0 - flow_time) * base_velocity
+            error = (target - action_estimate) * weights
+            correction = torch.autograd.grad(
+                action_estimate,
+                flow_state,
+                grad_outputs=error.detach(),
+                retain_graph=False,
+            )[0]
+
+        guidance_weight = DiffusionObjective._rtc_guidance_weight(
+            flow_time, rtc_processor.rtc_config.max_guidance_weight
+        )
+        guided_velocity = base_velocity + guidance_weight * correction
+
+        if rtc_processor.is_debug_enabled():
+            rtc_processor.track(
+                time=flow_time,
+                x_t=flow_state,
+                v_t=base_velocity,
+                x1_t=action_estimate,
+                correction=correction,
+                err=error,
+                weights=weights,
+                guidance_weight=guidance_weight,
+                inference_delay=inference_delay,
+                execution_horizon=execution_horizon,
+                time_convention="noise_to_data",
+                objective="flow_matching",
+            )
+
+        return guided_velocity.detach()
+
     def _euler_integrate(
-        self, model: nn.Module, x_init: Tensor, time_grid: Tensor, conditioning_vec: Tensor
+        self,
+        model: nn.Module,
+        x_init: Tensor,
+        time_grid: Tensor,
+        conditioning_vec: Tensor,
+        *,
+        dynamics=None,
     ) -> Tensor:
         x = x_init
         for i in range(len(time_grid) - 1):
             t_scalar = time_grid[i].item()
             dt = (time_grid[i + 1] - time_grid[i]).item()
-            t_batch = torch.full((x.shape[0],), t_scalar, dtype=x.dtype, device=x.device)
-            with torch.no_grad():
-                velocity = model(x, t_batch, conditioning_vec=conditioning_vec)
+            if dynamics is None:
+                t_batch = torch.full((x.shape[0],), t_scalar, dtype=x.dtype, device=x.device)
+                with torch.no_grad():
+                    velocity = model(x, t_batch, conditioning_vec=conditioning_vec)
+            else:
+                velocity = dynamics(x, t_scalar)
             x = x + dt * velocity
         return x
 
     def _rk4_integrate(
-        self, model: nn.Module, x_init: Tensor, time_grid: Tensor, conditioning_vec: Tensor
+        self,
+        model: nn.Module,
+        x_init: Tensor,
+        time_grid: Tensor,
+        conditioning_vec: Tensor,
+        *,
+        dynamics=None,
     ) -> Tensor:
         x = x_init
 
-        def dynamics(x_val: Tensor, t_scalar: float) -> Tensor:
+        def base_dynamics(x_val: Tensor, t_scalar: float) -> Tensor:
             t_batch = torch.full((x_val.shape[0],), t_scalar, dtype=x_val.dtype, device=x_val.device)
             with torch.no_grad():
                 return model(x_val, t_batch, conditioning_vec=conditioning_vec)
+
+        integration_dynamics = dynamics or base_dynamics
 
         for i in range(len(time_grid) - 1):
             t = time_grid[i].item()
             dt = (time_grid[i + 1] - time_grid[i]).item()
 
-            k1 = dynamics(x, t)
-            k2 = dynamics(x + dt * k1 / 2, t + dt / 2)
-            k3 = dynamics(x + dt * k2 / 2, t + dt / 2)
-            k4 = dynamics(x + dt * k3, t + dt)
+            k1 = integration_dynamics(x, t)
+            k2 = integration_dynamics(x + dt * k1 / 2, t + dt / 2)
+            k3 = integration_dynamics(x + dt * k2 / 2, t + dt / 2)
+            k4 = integration_dynamics(x + dt * k3, t + dt)
 
             x = x + dt / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
 

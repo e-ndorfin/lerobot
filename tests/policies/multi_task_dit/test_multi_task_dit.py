@@ -37,10 +37,16 @@ pytestmark = pytest.mark.skipif(
 
 from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.policies.multi_task_dit.configuration_multi_task_dit import MultiTaskDiTConfig
-from lerobot.policies.multi_task_dit.modeling_multi_task_dit import MultiTaskDiTPolicy
+from lerobot.policies.multi_task_dit.modeling_multi_task_dit import (
+    DiffusionObjective,
+    FlowMatchingObjective,
+    MultiTaskDiTPolicy,
+)
 from lerobot.policies.multi_task_dit.processor_multi_task_dit import (
     make_multi_task_dit_pre_post_processors,
 )
+from lerobot.policies.rtc.configuration_rtc import RTCConfig
+from lerobot.policies.rtc.modeling_rtc import RTCProcessor
 from lerobot.utils.constants import (
     ACTION,
     OBS_IMAGES,
@@ -515,6 +521,294 @@ def test_multi_task_dit_policy_flow_matching_objective():
         # Process action through postprocessor (PolicyAction is just a torch.Tensor)
         processed_action = postprocessor(selected_action)
         assert processed_action.shape == (batch_size, action_dim)
+
+
+def test_flow_matching_rtc_guides_only_the_executable_action_prefix():
+    config = create_config(with_visual=False, horizon=8, n_action_steps=4)
+    config.objective = "flow_matching"
+    config.num_integration_steps = 4
+    objective = FlowMatchingObjective(config, action_dim=10, horizon=8)
+    processor = RTCProcessor(RTCConfig(max_guidance_weight=1.0, execution_horizon=4, debug=True))
+
+    class ZeroVelocityPredictor(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.tensor(0.0))
+
+        def forward(self, sample, timestep, conditioning_vec):
+            return torch.zeros_like(sample) + self.anchor
+
+    model = ZeroVelocityPredictor()
+    conditioning = torch.zeros(1, 1)
+    previous = torch.zeros(4, 10)
+
+    torch.manual_seed(123)
+    with torch.no_grad():
+        unguided = objective.conditional_sample(model, batch_size=1, conditioning_vec=conditioning)
+
+    torch.manual_seed(123)
+    with torch.no_grad():
+        guided = objective.conditional_sample(
+            model,
+            batch_size=1,
+            conditioning_vec=conditioning,
+            rtc_processor=processor,
+            inference_delay=1,
+            prev_chunk_left_over=previous,
+            execution_horizon=4,
+            action_start=1,
+            action_steps=4,
+        )
+
+    assert guided.shape == (1, 8, 10)
+    assert torch.isfinite(guided).all()
+    assert torch.allclose(guided[:, 0], unguided[:, 0])
+    assert torch.linalg.vector_norm(guided[:, 1] - previous[0]) < torch.linalg.vector_norm(
+        unguided[:, 1] - previous[0]
+    )
+    assert len(processor.get_all_debug_steps()) == config.num_integration_steps
+
+
+def test_diffusion_rtc_places_previous_tail_at_action_offset():
+    config = create_config(with_visual=False, horizon=16, n_action_steps=8)
+    objective = DiffusionObjective(config, action_dim=10, horizon=16)
+    processor = RTCProcessor(RTCConfig(execution_horizon=8))
+    sample = torch.zeros(1, 16, 10)
+    previous = torch.ones(6, 10)
+
+    target, weights = objective._rtc_target_and_weights(
+        sample,
+        previous,
+        processor,
+        inference_delay=2,
+        execution_horizon=6,
+        action_start=1,
+        action_steps=8,
+    )
+
+    assert torch.all(target[:, 0] == 0)
+    assert torch.all(target[:, 1:7] == 1)
+    assert torch.all(target[:, 7:] == 0)
+    assert torch.all(weights[:, 0] == 0)
+    assert torch.all(weights[:, 1:3] == 1)
+    assert torch.all(weights[:, 7:] == 0)
+
+
+def test_diffusion_rtc_schedule_maps_trained_endpoints_and_is_monotonic():
+    config = create_config(with_visual=False, horizon=8, n_action_steps=4)
+    config.num_train_timesteps = 100
+    config.num_inference_steps = 20
+    objective = DiffusionObjective(config, action_dim=10, horizon=8)
+
+    timesteps, flow_times, alphas, sigmas = objective._rtc_flow_schedule(
+        device=torch.device("cpu"), dtype=torch.float64
+    )
+
+    assert len(timesteps) == 20
+    assert timesteps[0].item() == 99
+    assert timesteps[-1].item() == 0
+    assert torch.all(timesteps[1:] < timesteps[:-1])
+    assert torch.all(flow_times[1:] > flow_times[:-1])
+    assert 0 < flow_times[0] < 1
+    assert 0 < flow_times[-1] < 1
+    assert torch.allclose(flow_times, alphas / (alphas + sigmas))
+
+
+def test_diffusion_rtc_conversion_honors_scheduler_clean_sample_clipping():
+    config = create_config(with_visual=False, horizon=8, n_action_steps=4)
+    config.num_train_timesteps = 20
+    config.num_inference_steps = 6
+    config.clip_sample = True
+    objective = DiffusionObjective(config, action_dim=10, horizon=8)
+    processor = RTCProcessor(RTCConfig(max_guidance_weight=5.0, execution_horizon=0, debug=True))
+    clean_value = 2.5
+
+    class OracleEpsilonPredictor(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.tensor(0.0))
+
+        def forward(self, diffusion_state, timestep, conditioning_vec):
+            alpha_bar = objective.noise_scheduler.alphas_cumprod.to(diffusion_state)[timestep]
+            alpha = alpha_bar.sqrt().view(-1, 1, 1)
+            sigma = (1.0 - alpha_bar).sqrt().view(-1, 1, 1)
+            clean = torch.full_like(diffusion_state, clean_value)
+            return (diffusion_state - alpha * clean) / sigma + self.anchor
+
+    with torch.no_grad():
+        actions = objective.conditional_sample(
+            OracleEpsilonPredictor(),
+            batch_size=1,
+            conditioning_vec=torch.zeros(1, 1),
+            rtc_processor=processor,
+            inference_delay=0,
+            prev_chunk_left_over=torch.empty(0, 10),
+            execution_horizon=0,
+            action_steps=8,
+        )
+
+    assert torch.allclose(actions, torch.ones_like(actions), atol=2e-4, rtol=2e-4)
+    debug_steps = processor.get_all_debug_steps()
+    assert len(debug_steps) == config.num_inference_steps
+    tracked_times = torch.tensor([step.time for step in debug_steps])
+    tracked_deltas = torch.stack([step.metadata["flow_delta"] for step in debug_steps])
+    assert torch.allclose(tracked_deltas[:-1], tracked_times[1:] - tracked_times[:-1])
+    assert torch.allclose(tracked_deltas[-1], 1.0 - tracked_times[-1])
+    assert torch.allclose(tracked_deltas.sum(), 1.0 - tracked_times[0])
+
+
+def test_diffusion_rtc_sampler_runs_guidance_vjp_and_reduces_prefix_error():
+    config = create_config(with_visual=False, horizon=8, n_action_steps=4)
+    config.num_train_timesteps = 20
+    config.num_inference_steps = 4
+    config.clip_sample = False
+    objective = DiffusionObjective(config, action_dim=10, horizon=8)
+    processor = RTCProcessor(RTCConfig(max_guidance_weight=1.0, execution_horizon=4))
+
+    class InputDependentNoisePredictor(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.tensor(0.0))
+
+        def forward(self, sample, timestep, conditioning_vec):
+            alpha_bar = objective.noise_scheduler.alphas_cumprod.to(sample)[timestep]
+            alpha = alpha_bar.sqrt().view(-1, 1, 1)
+            sigma = (1.0 - alpha_bar).sqrt().view(-1, 1, 1)
+            flow_state = sample / (alpha + sigma)
+            # This makes the converted raw clean estimate exactly x_t, so the
+            # base velocity is zero while its RTC VJP is the identity.
+            return flow_state + self.anchor
+
+    model = InputDependentNoisePredictor()
+    conditioning = torch.zeros(1, 1)
+    previous = torch.zeros(4, 10)
+
+    torch.manual_seed(123)
+    with torch.no_grad():
+        unguided = objective.conditional_sample(
+            model,
+            batch_size=1,
+            conditioning_vec=conditioning,
+            rtc_processor=processor,
+            inference_delay=0,
+            prev_chunk_left_over=torch.empty(0, 10),
+            execution_horizon=0,
+            action_start=1,
+            action_steps=4,
+        )
+
+    torch.manual_seed(123)
+    with torch.no_grad():
+        guided = objective.conditional_sample(
+            model,
+            batch_size=1,
+            conditioning_vec=conditioning,
+            rtc_processor=processor,
+            inference_delay=1,
+            prev_chunk_left_over=previous,
+            execution_horizon=4,
+            action_start=1,
+            action_steps=4,
+        )
+
+    assert guided.shape == (1, 8, 10)
+    assert torch.isfinite(guided).all()
+    assert torch.linalg.vector_norm(guided[:, 1] - previous[0]) < torch.linalg.vector_norm(
+        unguided[:, 1] - previous[0]
+    )
+    _, flow_times, _, _ = objective._rtc_flow_schedule(device=torch.device("cpu"), dtype=torch.float32)
+    flow_deltas = torch.cat([flow_times[1:] - flow_times[:-1], 1.0 - flow_times[-1:]])
+    # For this oracle, v=0, g=-x, lambda=1, and the first prefix weight is 1.
+    # The product therefore includes every non-uniform Euler interval, including
+    # the terminal interval from the lowest trained diffusion timestep to t=1.
+    expected_guided_prefix = unguided[:, 1] * torch.prod(1.0 - flow_deltas)
+    assert torch.allclose(guided[:, 1], expected_guided_prefix, atol=1e-5, rtol=1e-5)
+
+
+def test_diffusion_rtc_caps_actual_guidance_displacement():
+    config = create_config(with_visual=False, horizon=8, n_action_steps=4)
+    config.num_train_timesteps = 100
+    config.num_inference_steps = 8
+    config.clip_sample = False
+    objective = DiffusionObjective(config, action_dim=10, horizon=8)
+    max_step_rms = 0.01
+    processor = RTCProcessor(
+        RTCConfig(
+            max_guidance_weight=100.0,
+            execution_horizon=4,
+            diffusion_max_guidance_step_rms=max_step_rms,
+            debug=True,
+        )
+    )
+
+    class ZeroEpsilonPredictor(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.tensor(0.0))
+
+        def forward(self, sample, timestep, conditioning_vec):
+            return torch.zeros_like(sample) + self.anchor
+
+    with torch.no_grad():
+        actions = objective.conditional_sample(
+            ZeroEpsilonPredictor(),
+            batch_size=1,
+            conditioning_vec=torch.zeros(1, 1),
+            rtc_processor=processor,
+            inference_delay=1,
+            prev_chunk_left_over=torch.zeros(4, 10),
+            execution_horizon=4,
+            action_start=1,
+            action_steps=4,
+        )
+
+    assert torch.isfinite(actions).all()
+    steps = processor.get_all_debug_steps()
+    assert len(steps) == config.num_inference_steps
+    assert any(float(step.metadata["guidance_scale"].item()) < 1.0 for step in steps)
+    for step in steps:
+        applied_rms = step.metadata["guidance_delta_rms"] * step.metadata["guidance_scale"]
+        assert float(applied_rms.item()) <= max_step_rms + 1e-6
+
+
+def test_diffusion_non_rtc_sampling_keeps_checkpoint_scheduler_path(monkeypatch):
+    config = create_config(with_visual=False, horizon=8, n_action_steps=4)
+    config.noise_scheduler_type = "DDPM"
+    config.num_train_timesteps = 20
+    config.num_inference_steps = 4
+    objective = DiffusionObjective(config, action_dim=10, horizon=8)
+
+    class ZeroNoisePredictor(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.tensor(0.0))
+
+        def forward(self, sample, timestep, conditioning_vec):
+            return torch.zeros_like(sample) + self.anchor
+
+    scheduler_steps = []
+    original_step = objective.noise_scheduler.step
+
+    def recording_step(*args, **kwargs):
+        scheduler_steps.append(int(args[1]))
+        return original_step(*args, **kwargs)
+
+    monkeypatch.setattr(objective.noise_scheduler, "step", recording_step)
+    monkeypatch.setattr(
+        objective,
+        "_rtc_flow_schedule",
+        lambda **_kwargs: pytest.fail("non-RTC inference entered the converted-flow path"),
+    )
+
+    with torch.no_grad():
+        actions = objective.conditional_sample(
+            ZeroNoisePredictor(),
+            batch_size=1,
+            conditioning_vec=torch.zeros(1, 1),
+        )
+
+    assert actions.shape == (1, 8, 10)
+    assert len(scheduler_steps) == config.num_inference_steps
 
 
 def test_multi_task_dit_policy_save_and_load(tmp_path):
