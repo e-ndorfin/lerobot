@@ -151,7 +151,7 @@ class RTCProcessor:
               right-padded with zeros to match ``T``.
             - Prefix weights are constructed via ``get_prefix_weights(inference_delay, execution_horizon, T)``
               and broadcast to ``(B, T, A)``.
-            - Guidance correction is computed via autograd using ``x1_t = x_t + time * v_t`` and
+            - Guidance correction is computed via autograd using ``x1_t = x_t - time * v_t`` and
               ``error = (prev_chunk_left_over - x1_t) * weights``.
             - The final guidance weight is clamped by ``max_guidance_weight`` from the config.
 
@@ -210,8 +210,12 @@ class RTCProcessor:
         )
 
         with torch.enable_grad():
-            v_t = original_denoise_step_partial(x_t)
+            # ``x_t`` must require gradients before the denoiser forward pass.
+            # RTC's correction is the full VJP of the clean-action estimate,
+            # including the denoiser's dependence on x_t (Algorithm 1, line 29
+            # in the RTC paper).
             x_t.requires_grad_(True)
+            v_t = original_denoise_step_partial(x_t)
 
             x1_t = x_t - time * v_t  # noqa: N806
             err = (prev_chunk_left_over - x1_t) * weights

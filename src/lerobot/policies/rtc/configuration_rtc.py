@@ -38,10 +38,13 @@ class RTCConfig:
     enabled: bool = True
 
     # Core RTC settings
-    # Todo change to exp
-    prefix_attention_schedule: RTCAttentionSchedule = RTCAttentionSchedule.LINEAR
+    prefix_attention_schedule: RTCAttentionSchedule = RTCAttentionSchedule.EXP
     max_guidance_weight: float = 10.0
     execution_horizon: int = 10
+
+    # Bounds the actual diffusion RTC Euler displacement in normalized model
+    # space, rather than only bounding its scalar guidance multiplier.
+    diffusion_max_guidance_step_rms: float = 0.25
 
     # Debug settings
     debug: bool = False
@@ -51,5 +54,10 @@ class RTCConfig:
         """Validate RTC configuration parameters."""
         if self.max_guidance_weight <= 0:
             raise ValueError(f"max_guidance_weight must be positive, got {self.max_guidance_weight}")
+        if self.diffusion_max_guidance_step_rms <= 0:
+            raise ValueError(
+                "diffusion_max_guidance_step_rms must be positive, "
+                f"got {self.diffusion_max_guidance_step_rms}"
+            )
         if self.debug_maxlen <= 0:
             raise ValueError(f"debug_maxlen must be positive, got {self.debug_maxlen}")

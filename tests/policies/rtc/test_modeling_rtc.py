@@ -237,6 +237,29 @@ def test_get_prefix_weights_exp_schedule():
     assert torch.all(weights[14:] == 0.0)
 
 
+def test_exp_prefix_weights_match_rtc_equation_5_exactly():
+    """EXP uses d as start and H-s as the exclusive overlap endpoint."""
+    config = RTCConfig(prefix_attention_schedule=RTCAttentionSchedule.EXP)
+    processor = RTCProcessor(config)
+    delay = 2
+    prediction_horizon = 10
+    execution_steps = 4
+    overlap_end = prediction_horizon - execution_steps
+
+    weights = processor.get_prefix_weights(delay, overlap_end, prediction_horizon)
+    expected = torch.zeros(prediction_horizon)
+    expected[:delay] = 1.0
+    indices = torch.arange(delay, overlap_end)
+    c_i = (overlap_end - indices) / (overlap_end - delay + 1)
+    expected[delay:overlap_end] = c_i * torch.expm1(c_i) / (torch.e - 1)
+
+    assert torch.allclose(weights, expected)
+
+
+def test_rtc_defaults_to_exponential_prefix_attention():
+    assert RTCConfig().prefix_attention_schedule == RTCAttentionSchedule.EXP
+
+
 def test_get_prefix_weights_with_start_equals_end():
     """Test get_prefix_weights when start equals end."""
     config = RTCConfig(prefix_attention_schedule=RTCAttentionSchedule.LINEAR)
@@ -407,16 +430,16 @@ def test_denoise_step_with_prev_chunk(rtc_processor_debug_disabled):
     expected_result = torch.tensor(
         [
             [
-                [1.8000],
-                [1.8000],
-                [1.8000],
-                [1.8000],
-                [1.8000],
-                [1.5833],
-                [1.3667],
+                [1.4750],
+                [1.4750],
+                [1.4750],
+                [1.4750],
+                [1.4750],
+                [1.3125],
                 [1.1500],
-                [0.9333],
-                [0.7167],
+                [0.9875],
+                [0.8250],
+                [0.6625],
                 [0.5000],
                 [0.5000],
                 [0.5000],
@@ -461,7 +484,10 @@ def test_denoise_step_adds_batch_dimension():
 
 def test_denoise_step_uses_custom_execution_horizon():
     """Test denoise_step uses custom execution_horizon parameter."""
-    config = RTCConfig(execution_horizon=10)
+    config = RTCConfig(
+        execution_horizon=10,
+        prefix_attention_schedule=RTCAttentionSchedule.LINEAR,
+    )
     processor = RTCProcessor(config)
 
     x_t = torch.ones(1, 20, 1)
@@ -482,21 +508,21 @@ def test_denoise_step_uses_custom_execution_horizon():
     expected_result = torch.tensor(
         [
             [
-                [1.8000],
-                [1.8000],
-                [1.8000],
-                [1.8000],
-                [1.8000],
-                [1.6818],
-                [1.5636],
-                [1.4455],
-                [1.3273],
+                [1.4750],
+                [1.4750],
+                [1.4750],
+                [1.4750],
+                [1.4750],
+                [1.3864],
+                [1.2977],
                 [1.2091],
-                [1.0909],
-                [0.9727],
+                [1.1205],
+                [1.0318],
+                [0.9432],
                 [0.8545],
-                [0.7364],
-                [0.6182],
+                [0.7659],
+                [0.6773],
+                [0.5886],
                 [0.5000],
                 [0.5000],
                 [0.5000],

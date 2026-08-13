@@ -16,6 +16,8 @@
 
 """Tests for RTC configuration module."""
 
+import pytest
+
 from lerobot.configs.types import RTCAttentionSchedule
 from lerobot.policies.rtc.configuration_rtc import RTCConfig
 
@@ -27,9 +29,10 @@ def test_rtc_config_default_initialization():
     config = RTCConfig()
 
     assert config.enabled is True
-    assert config.prefix_attention_schedule == RTCAttentionSchedule.LINEAR
+    assert config.prefix_attention_schedule == RTCAttentionSchedule.EXP
     assert config.max_guidance_weight == 10.0
     assert config.execution_horizon == 10
+    assert config.diffusion_max_guidance_step_rms == 0.25
     assert config.debug is False
     assert config.debug_maxlen == 100
 
@@ -41,6 +44,7 @@ def test_rtc_config_custom_initialization():
         prefix_attention_schedule=RTCAttentionSchedule.EXP,
         max_guidance_weight=5.0,
         execution_horizon=20,
+        diffusion_max_guidance_step_rms=0.1,
         debug=True,
         debug_maxlen=200,
     )
@@ -49,6 +53,7 @@ def test_rtc_config_custom_initialization():
     assert config.prefix_attention_schedule == RTCAttentionSchedule.EXP
     assert config.max_guidance_weight == 5.0
     assert config.execution_horizon == 20
+    assert config.diffusion_max_guidance_step_rms == 0.1
     assert config.debug is True
     assert config.debug_maxlen == 200
 
@@ -60,6 +65,11 @@ def test_rtc_config_partial_initialization():
     assert config.enabled is True
     assert config.max_guidance_weight == 15.0
     # Other values should be defaults
-    assert config.prefix_attention_schedule == RTCAttentionSchedule.LINEAR
+    assert config.prefix_attention_schedule == RTCAttentionSchedule.EXP
     assert config.execution_horizon == 10
     assert config.debug is False
+
+
+def test_rtc_config_rejects_nonpositive_diffusion_guidance_step_cap():
+    with pytest.raises(ValueError, match="diffusion_max_guidance_step_rms"):
+        RTCConfig(diffusion_max_guidance_step_rms=0.0)
